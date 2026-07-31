@@ -1,0 +1,8 @@
+# 构建产物：每次 scripts/package.js 都会整体重建，不放需要留存的东西
+dist/
+
+# 测试用的参考实现（可选开发依赖，按需 npm i）
+test/ref/node_modules/
+test/ref/package-lock.json
+
+.DS_Store

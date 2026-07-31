@@ -1,0 +1,112 @@
+# Kiro Remote Bridge
+
+在手机浏览器里浏览和操作**本机 Kiro IDE** 的 agent 会话：看会话列表与历史、跟着流式思维链、发消息、新建会话。
+
+一个 VS Code 扩展 + 一个自带的手机端页面。零运行时依赖，只用 Node 标准库。
+
+> 状态：能日常用，但有几个明确的已知限制，见[已知限制](#已知限制)。请先读那一节再决定要不要装。
+
+## 为什么会有这个东西
+
+官方 [Kiro for iOS](https://kiro.dev/mobile/) 连的是**云端**会话。而很多人的实际用法是：agent 跑在自己那台开着 IDE 的机器上，跑长任务时人想离开桌子，又不想失去对进度的可见性。Kiro 仓库里也有针对远程控制的讨论（[kirodotdev/Kiro#6099](https://github.com/kirodotdev/Kiro/issues/6099)）。
+
+这个项目解决的是后者：**把本机 IDE 里正在跑的会话搬到手机上看**，不需要云端会话，也不需要把机器暴露到公网。
+
+## 特性
+
+- **直连 agent，不模拟 UI** —— 走 Kiro 的 agent mux server（ACP over WebSocket），不截屏、不注入 IDE 前端
+- **流式思维链** —— 消费 `agent_thought_chunk` 增量，思考逐块长出来，跑完自动折叠成 `Thought complete`
+- **双数据源分层降级** —— 会话列表与历史读 `~/.kiro/sessions`，发消息与批准走 mux；一层不可用不会让另一层失效
+- **零运行时依赖** —— WebSocket 服务端、二维码编码器都是手写的，只用 Node 标准库
+- **扫码即用** —— 局域网内扫二维码打开，带 token 鉴权
+- **一致性门禁** —— 140 个测试，含 UI 一致性检查（DOM id / CSS class / 前后端消息类型双向对齐）与二维码逐版本对照参考实现
+
+## 快速开始
+
+需要 macOS + Kiro IDE。（只在 macOS 上验证过；代码本身没有平台假设，但安装脚本里的路径是 macOS 的。）
+
+```bash
+git clone <your-repo-url> kiro-remote-bridge
+cd kiro-remote-bridge
+
+# 打包
+node scripts/package.js
+
+# 安装（推荐走官方 CLI，会写入完整 metadata）
+"/Applications/Kiro.app/Contents/Resources/app/bin/code" \
+  --install-extension dist/local.kiro-remote-bridge-<version>.vsix --force
+```
+
+然后在 Kiro 里重载窗口（命令面板 → `Developer: Reload Window`），再执行：
+
+- `Kiro Bridge: 启动远程会话` —— 启动本地中继
+- `Kiro Bridge: 显示访问地址与二维码` —— 用手机扫码打开
+
+其他命令：`停止远程会话`、`运行自诊断`、`探测 agent 方法`、`显示日志`。
+
+## 架构
+
+```
+手机浏览器  ──WebSocket(token)──>  relay（扩展内）
+                                     │
+                    ┌────────────────┴────────────────┐
+                    │                                 │
+            读 ~/.kiro/sessions              agent mux server
+            （列表 / 历史 / tail）          （ACP over WebSocket）
+            格式已实测确认                   发消息 / 权限响应 / 新建会话
+```
+
+两层各取确定可行的部分，任何一层不可用都不会让另一层失效，自诊断会把**实际生效的路径**写进日志。
+
+思维链有两条通路，都用上了：
+
+| 来源 | 用途 | 原因 |
+| --- | --- | --- |
+| mux `agent_thought_chunk` | 实时流式显示 | 逐块推送，能做到真流式 |
+| `~/.kiro/sessions` tail | 权威内容与历史 | 实测思考是整块落盘的（跨度 0 秒），无法从文件做流式 |
+
+实时内容只作为「正在思考」的临时占位，权威版本一到就替换掉，避免同一段思考出现两遍。
+
+## 已知限制
+
+**远程批准工具调用目前不生效。** 手机上会弹出授权框，但那个权限请求已经在 agent 侧被自动取消了 —— 实测 8 次全部在 **6–130 毫秒**内被取消，人不可能在这个时间内响应。桥的批准响应格式正确、也确实发了出去，只是送到了一个已经结束的请求。这不是本项目能修的，取消发生在 Kiro 内部。
+
+影响：**不在 shell 白名单里的命令，在手机上无法放行**。白名单内的命令不受影响（不产生审批交互，直接执行）。想扩大可用范围，就往 `~/.kiro/settings/permissions.yaml` 里补命令。
+
+**模型清单在首次使用时不完整。** `_kiro/config/template` 在结构上不返回模型列表（它把 `currentModelId` 传成 `undefined`，模型项整条被省略）。全量清单只出现在 `session/new` 与 `session/set_config_option` 的返回里，所以本项目见到一次就缓存下来。后果是：**第一次打开模型选择时只有你用过的模型**，从手机新建一次会话之后才完整。降级级别会写进日志（`[presets] ... 来源 agent|cache|history`）。
+
+**只有思考走实时流。** 正文仍靠文件 tail，约 1 秒一批。
+
+## 安全说明
+
+- 中继**默认监听 `0.0.0.0`**，即同一局域网内可达。不要在不可信网络（公共 WiFi、共享办公网）里开着。
+- 鉴权是 URL 里的 token，41+ 字符随机生成，**每次重启中继都会变**（旧链接随即失效）。
+- 二维码与访问地址里含 token，不要截图外发。
+- 自诊断会把 mux 端点和 token 写到 `~/.kiro-bridge/mux-endpoints.json`（权限 0600），仅本机调试用，不需要时删掉即可。
+- 静态资源做了路径穿越防护；外壳页可无 token 加载，但不含任何会话数据。
+
+## 开发
+
+```bash
+node test/run-all.mjs        # 全量测试（140 项）
+node test/t8-ui-consistency.mjs   # 只跑 UI 一致性门禁
+```
+
+二维码测试（t4）会与 [`qrcode`](https://www.npmjs.com/package/qrcode) 逐版本对照。它是**仅用于测试的可选依赖**，不进产物：
+
+```bash
+cd test/ref && npm i
+```
+
+`media/qr.js` 是自己实现的编码器，`qrcode` 只作为校验基准。
+
+## 致谢
+
+<!-- 待确认：借鉴思路的原项目仓库地址。确认后替换下面这行。 -->
+思路上参考了社区里同类的远程控制尝试（原项目：_待补链接_），实现是独立编写的：本项目直连 agent mux server（ACP over WebSocket），并叠加了双数据源分层降级、流式思维链与 UI 一致性门禁。
+
+同类项目：[Homas/kiro-telegram-integration](https://github.com/Homas/kiro-telegram-integration) 走 IM 转发通知与审批，思路不同但目标相近。
+
+## License
+
+[MIT](./LICENSE)

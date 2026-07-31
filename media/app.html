@@ -1,0 +1,1124 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,maximum-scale=1">
+<meta name="theme-color" content="#0d0f11">
+<title>Kiro Remote</title>
+<link rel="manifest" href="manifest.json">
+<style>
+  :root{
+    --bg:#0d0f11; --card:#16191d; --card2:#1c2025; --line:#24282e; --line2:#2f343b;
+    --fg:#e8eaed; --fg2:#b6bec6; --dim:#8b949e; --faint:#6b7480;
+    --blue:#4a9eff; --green:#3fb950; --amber:#d29922; --red:#f85149; --purple:#a371f7;
+    --r:12px;
+  }
+  *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+  html,body{margin:0;height:100%;overflow:hidden;background:var(--bg);color:var(--fg);
+    font:15px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,system-ui,sans-serif;
+    -webkit-font-smoothing:antialiased}
+  #app{display:flex;flex-direction:column;height:100%}
+
+  /* ---------- 顶栏 ---------- */
+  header{flex:0 0 auto;background:var(--bg);border-bottom:1px solid var(--line);
+    padding:calc(env(safe-area-inset-top) + 8px) 12px 8px}
+  .hrow{display:flex;align-items:center;gap:10px;min-height:34px}
+  /* Kiro 标记 + 叠在右下角的连接状态点 */
+  .brand{position:relative;flex:0 0 auto;width:27px;height:27px}
+  .brand svg{width:100%;height:100%;display:block}
+  .brand .dot{position:absolute;right:-2px;bottom:-2px;width:10px;height:10px;
+    border:2px solid var(--bg)}
+  .dot{width:8px;height:8px;border-radius:50%;background:var(--faint);flex:0 0 auto;
+    transition:background .2s}
+  .dot.running{background:var(--green);box-shadow:0 0 0 3px #3fb95022;animation:bp 1.5s infinite}
+  .dot.waiting{background:var(--amber);box-shadow:0 0 0 3px #d2992222;animation:bp .9s infinite}
+  .dot.off{background:var(--red)}
+  @keyframes bp{0%,100%{opacity:1}50%{opacity:.4}}
+  .htitle{flex:1;min-width:0;font-size:16px;font-weight:600;letter-spacing:-.01em;
+    overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .hsub{font-size:11px;color:var(--dim);font-weight:400;margin-top:1px;
+    overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .iconbtn{flex:0 0 auto;width:34px;height:34px;display:flex;align-items:center;
+    justify-content:center;border:none;background:transparent;color:var(--fg2);
+    border-radius:9px;font-size:17px;padding:0}
+  .iconbtn:active{background:var(--card2)}
+  .hide{display:none!important}
+
+  /* ---------- 搜索 ---------- */
+  .searchwrap{padding:8px 0 2px}
+  .searchwrap input{width:100%;background:var(--card);border:1px solid var(--line);
+    border-radius:10px;padding:9px 12px;color:var(--fg);font:inherit;font-size:14px}
+  .searchwrap input::placeholder{color:var(--faint)}
+
+  main{flex:1;overflow-y:auto;overscroll-behavior-y:contain;-webkit-overflow-scrolling:touch;
+    padding:10px 12px calc(env(safe-area-inset-bottom) + 12px)}
+
+  /* ---------- 筛选条 ---------- */
+  .fbar{display:flex;align-items:center;gap:8px;flex-wrap:wrap;font-size:11px;
+    color:var(--dim);margin:0 0 12px}
+  .fbar .sp{margin-left:auto;display:flex;gap:6px}
+  .chip{font:inherit;font-size:11px;padding:5px 10px;border-radius:999px;
+    background:var(--card);border:1px solid var(--line);color:var(--fg2)}
+  .chip:active{background:var(--card2)}
+  .chip.on{background:#4a9eff1f;border-color:#4a9eff66;color:var(--blue)}
+
+
+  /* ---------- 会话卡片（含左滑） ---------- */
+  .sw{position:relative;overflow:hidden;border-radius:var(--r);margin-bottom:8px;
+    background:#2b3239}
+  .sw-act{position:absolute;inset:0 0 0 auto;width:76px;display:flex;align-items:center;
+    justify-content:center;color:var(--fg2)}
+  .sw-act svg{width:21px;height:21px;display:block}
+  .card{position:relative;background:var(--card);border:1px solid var(--line);
+    border-radius:var(--r);padding:11px 13px 10px;will-change:transform}
+  .card.anim{transition:transform .22s cubic-bezier(.22,.61,.36,1)}
+  .card:active{background:var(--card2)}
+  .card .bar{position:absolute;left:0;top:11px;bottom:11px;width:3px;border-radius:0 2px 2px 0;
+    background:transparent}
+  .card.s-running .bar{background:var(--green)}
+  .card.s-waiting .bar{background:var(--amber)}
+  .ttl{font-size:14.5px;font-weight:500;line-height:1.42;color:var(--fg);
+    display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+  .meta{margin-top:6px;display:flex;align-items:center;gap:6px;font-size:11px;
+    color:var(--faint);min-width:0}
+  .meta .t{color:var(--dim)}
+  .meta .sep{opacity:.4}
+  .meta .model,.meta .ws{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .meta .ws{color:var(--dim)}
+  .badge{margin-left:auto;flex:0 0 auto;font-size:10px;padding:2px 7px;border-radius:999px;
+    border:1px solid transparent;font-weight:500}
+  .badge.running{color:var(--green);background:#3fb95018;border-color:#3fb95040}
+  .badge.waiting{color:var(--amber);background:#d2992218;border-color:#d2992240}
+
+  /* ---------- 归档页 ---------- */
+  .arch{display:flex;align-items:center;gap:10px;background:var(--card);
+    border:1px solid var(--line);border-radius:var(--r);padding:11px 13px;margin-bottom:8px}
+  .arch-main{flex:1;min-width:0}
+  .arch-back{flex:0 0 auto;font:inherit;font-size:12.5px;padding:7px 13px;border-radius:8px;
+    background:var(--card2);border:1px solid var(--line2);color:var(--fg2)}
+  .arch-back:active{background:#333a42}
+  .arch-all{width:100%;margin-top:12px;padding:12px;border-radius:10px;font:inherit;
+    font-size:13.5px;background:transparent;border:1px solid var(--line2);color:var(--dim)}
+
+  /* ---------- 会话详情 ---------- */
+  .u{display:flex;justify-content:flex-end;margin:0 0 12px}
+  /* 用户气泡：要一眼能从整屏深色里分出来，所以给足饱和度和边框对比 */
+  .u .b{max-width:88%;background:#1d4b80;border:1px solid #3d7ec4;
+    border-radius:14px 14px 4px 14px;padding:10px 13px;font-size:14.5px;color:var(--fg);
+    box-shadow:0 1px 3px #00000059;white-space:pre-wrap;word-break:break-word}
+  /* 助手消息：左侧 Kiro 头像 + 全宽正文（长文本不套气泡，可读性更好） */
+  .arow{display:flex;gap:9px;align-items:flex-start;margin:0 0 14px}
+  .ava{flex:0 0 auto;width:22px;height:22px;margin-top:1px}
+  .ava svg{width:100%;height:100%;display:block}
+  .arow .a{margin:0;flex:1;min-width:0}
+  .a{margin:0 0 14px;font-size:14.5px;line-height:1.62;color:var(--fg2);
+    white-space:pre-wrap;word-break:break-word}
+  .a strong{color:var(--fg);font-weight:600}
+  /* 行内代码：正文与用户气泡里都可能出现 */
+  .a code,.u .b code{font-family:ui-monospace,SFMono-Regular,monospace;font-size:.88em;
+    background:var(--card2);border:1px solid var(--line);border-radius:4px;padding:1px 4px;
+    color:var(--fg)}
+  .u .b strong{color:#fff;font-weight:600}
+  .u .b code{background:#00000038;border-color:#ffffff26}
+  .tool{margin:0 0 8px;background:var(--card);border:1px solid var(--line);
+    border-radius:9px;overflow:hidden}
+  .tool .hd{display:flex;align-items:center;gap:7px;padding:8px 11px;font-size:12.5px}
+  .tool .caret{color:var(--faint);font-size:10px;transition:transform .18s;flex:0 0 auto}
+  .tool.open .caret{transform:rotate(90deg)}
+  .tool .nm{color:var(--fg2);font-weight:500;font-family:ui-monospace,SFMono-Regular,monospace;
+    font-size:12px}
+  .tool .ex{color:var(--dim);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+    min-width:0;flex:1}
+  .tool .st{flex:0 0 auto;font-size:10px;color:var(--faint)}
+  .tool .st.failed,.tool .st.denied{color:var(--red)}
+  .tool .bd{display:none;padding:0 11px 10px;font-size:11.5px;color:var(--dim);
+    font-family:ui-monospace,SFMono-Regular,monospace;white-space:pre-wrap;
+    word-break:break-all;border-top:1px solid var(--line);padding-top:9px;margin-top:0}
+  .tool.open .bd{display:block}
+  /* 思考块：比工具卡片更弱化，展开后按正文排版（推理是散文，不是代码） */
+  .tool.think{background:transparent}
+  .tool.think .nm{color:var(--faint);font-family:inherit;font-weight:400}
+  .tool.think .bd{font-family:inherit;font-size:12px;line-height:1.6;
+    color:var(--faint);white-space:pre-wrap;word-break:break-word}
+  /* 正在思考：标签提亮一点，让「还在想」和「想完了」有区别 */
+  .tool.think[data-live] .nm{color:var(--dim)}
+  .tool.think .ex{text-align:right}
+  .sys{font-size:11px;color:var(--faint);text-align:center;margin:14px 0}
+  .divider{display:flex;align-items:center;gap:10px;margin:18px 0;color:var(--faint);
+    font-size:10.5px}
+  .divider::before,.divider::after{content:'';flex:1;height:1px;background:var(--line)}
+  .err{margin:0 0 10px;padding:9px 12px;border-radius:9px;background:#f8514912;
+    border:1px solid #f8514933;color:#ffb4ae;font-size:12.5px}
+
+  /* ---------- 待批准 ---------- */
+  #pend{flex:0 0 auto;margin:0 12px 8px;padding:12px 13px;border-radius:var(--r);
+    background:#2a2109;border:1px solid #d2992255}
+  #pend .q{font-size:13px;line-height:1.5;color:#ffe9b8;white-space:pre-wrap;
+    max-height:120px;overflow-y:auto}
+  #pend .acts{display:flex;gap:8px;margin-top:11px}
+  #pend button{flex:1;padding:10px;border-radius:9px;font:inherit;font-size:14px;
+    font-weight:500;border:1px solid var(--line2);background:var(--card2);color:var(--fg)}
+  #pend button.ok{background:var(--green);border-color:var(--green);color:#05210c}
+  #pend button.no{background:transparent;border-color:#f8514966;color:#ff9d95}
+
+  /* ---------- 输入区 ---------- */
+  footer{flex:0 0 auto;background:var(--bg);border-top:1px solid var(--line);
+    padding:8px 12px calc(env(safe-area-inset-bottom) + 8px)}
+  .cmp{display:flex;gap:8px;align-items:flex-end}
+  .cmp textarea{flex:1;resize:none;max-height:132px;background:var(--card);color:var(--fg);
+    border:1px solid var(--line);border-radius:11px;padding:10px 13px;font:inherit;
+    font-size:15px;line-height:1.45}
+  .cmp textarea::placeholder{color:var(--faint)}
+  .cmp textarea:focus{outline:none;border-color:#35507a}
+  .sendbtn{flex:0 0 auto;width:42px;height:42px;border-radius:50%;border:none;
+    background:var(--blue);color:#fff;font-size:17px;display:flex;align-items:center;
+    justify-content:center;padding:0}
+  .sendbtn:disabled{background:var(--card2);color:var(--faint)}
+
+  /* ---------- 新建会话面板 ---------- */
+  #sheet{position:fixed;inset:0;z-index:50}
+  .sh-bd{position:absolute;inset:0;background:#000a;backdrop-filter:blur(2px)}
+  .sh-panel{position:absolute;left:0;right:0;bottom:0;background:var(--card);
+    border-top:1px solid var(--line2);border-radius:18px 18px 0 0;
+    padding:8px 16px calc(env(safe-area-inset-bottom) + 16px);
+    max-height:82vh;overflow-y:auto;animation:up .24s cubic-bezier(.22,.61,.36,1)}
+  @keyframes up{from{transform:translateY(100%)}to{transform:translateY(0)}}
+  .sh-grab{width:36px;height:4px;border-radius:2px;background:var(--line2);
+    margin:2px auto 12px}
+  .sh-title{font-size:16px;font-weight:600;margin:0 0 16px}
+  .sh-step{display:flex;align-items:center;gap:7px;font-size:12px;color:var(--fg2);
+    margin:18px 0 8px;font-weight:500}
+  .sh-step:first-of-type{margin-top:0}
+  .sh-step i{width:17px;height:17px;border-radius:50%;background:var(--line2);
+    color:var(--fg2);font-size:10px;font-style:normal;display:flex;align-items:center;
+    justify-content:center;flex:0 0 auto}
+  .sh-hint{font-size:12px;color:var(--faint)}
+  .sh-chips{display:flex;gap:7px;flex-wrap:wrap}
+  .sh-chips button{font:inherit;font-size:12.5px;padding:7px 13px;border-radius:9px;
+    background:var(--card2);border:1px solid var(--line);color:var(--fg2)}
+  .sh-chips button.sel{background:#4a9eff1f;border-color:#4a9eff77;color:var(--blue)}
+  .sh-models{display:flex;flex-direction:column;gap:6px}
+  .sh-models button{font:inherit;font-size:14px;text-align:left;padding:11px 13px;
+    border-radius:10px;background:var(--card2);border:1px solid var(--line);
+    color:var(--fg2);display:flex;align-items:center;gap:9px}
+  .sh-models button.sel{background:#4a9eff1a;border-color:#4a9eff77;color:var(--fg)}
+  .sh-models .tick{margin-left:auto;color:var(--blue);opacity:0;font-size:13px}
+  .sh-models button.sel .tick{opacity:1}
+  .sh-models .src{font-size:10px;color:var(--faint)}
+  .sh-models .desc{display:block;font-size:11px;color:var(--faint);margin-top:2px;
+    line-height:1.4}
+  .sh-models .mtxt{flex:1;min-width:0}
+  .sh-go{width:100%;margin-top:20px;padding:13px;border-radius:11px;border:none;
+    background:var(--blue);color:#fff;font:inherit;font-size:15px;font-weight:500}
+  .sh-go:disabled{background:var(--card2);color:var(--faint)}
+
+  #toast{position:fixed;left:50%;transform:translateX(-50%) translateY(6px);
+    bottom:calc(env(safe-area-inset-bottom) + 76px);background:#1f2429;
+    border:1px solid var(--line2);border-radius:11px;padding:10px 16px;font-size:13px;
+    opacity:0;transition:opacity .2s,transform .2s;pointer-events:none;z-index:40;
+    max-width:88vw;text-align:center;box-shadow:0 6px 24px #0009}
+  #toast.on{opacity:1;transform:translateX(-50%) translateY(0)}
+  .empty{text-align:center;color:var(--faint);font-size:13px;margin-top:56px;line-height:2}
+</style>
+</head>
+<body>
+<!-- Kiro 标记：定义一次，顶栏与每条助手消息复用 -->
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <symbol id="kiro" viewBox="0 0 32 32">
+    <rect width="32" height="32" rx="7.5" fill="#0f1113"/>
+    <circle cx="16" cy="16" r="9.2" fill="#fff"/>
+    <ellipse cx="12.7" cy="14.5" rx="1.7" ry="2.2" fill="#0f1113"/>
+    <ellipse cx="19.3" cy="14.5" rx="1.7" ry="2.2" fill="#0f1113"/>
+  </symbol>
+  <symbol id="ic-archive" viewBox="0 0 24 24">
+    <g fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"
+       stroke-linejoin="round">
+      <rect x="3" y="4" width="18" height="4" rx="1"/>
+      <path d="M5 8v11a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1V8"/>
+      <path d="M10 12.5h4"/>
+    </g>
+  </symbol>
+</svg>
+<div id="app">
+  <header>
+    <div class="hrow">
+      <button class="iconbtn hide" id="back" aria-label="返回">‹</button>
+      <span class="brand">
+        <svg><use href="#kiro"/></svg>
+        <span class="dot off" id="dot"></span>
+      </span>
+      <div style="flex:1;min-width:0">
+        <div class="htitle" id="title">连接中…</div>
+        <div class="hsub hide" id="sub"></div>
+      </div>
+      <button class="iconbtn" id="searchBtn" aria-label="搜索">⌕</button>
+      <button class="iconbtn" id="newBtn" aria-label="新建会话">+</button>
+    </div>
+    <div class="searchwrap hide" id="searchWrap">
+      <input id="search" placeholder="搜索会话标题…" autocomplete="off" enterkeyhint="search">
+    </div>
+  </header>
+
+  <div id="pend" class="hide">
+    <div class="q" id="pq"></div>
+    <div class="acts">
+      <button class="ok" id="pok">允许</button>
+      <button class="no" id="pno">拒绝</button>
+    </div>
+  </div>
+
+  <main id="main"></main>
+
+  <footer id="composer" class="hide">
+    <div class="cmp">
+      <textarea id="input" rows="1" placeholder="发消息…"></textarea>
+      <button class="sendbtn" id="send" disabled aria-label="发送">↑</button>
+    </div>
+  </footer>
+</div>
+<div id="sheet" class="hide">
+  <div class="sh-bd" id="shBd"></div>
+  <div class="sh-panel">
+    <div class="sh-grab"></div>
+    <div class="sh-title">新建会话</div>
+    <div class="sh-step"><i>1</i>工作区</div>
+    <div class="sh-chips" id="wsChips"><span class="sh-hint">读取中…</span></div>
+    <div class="sh-step"><i>2</i>模式</div>
+    <div class="sh-chips" id="modeChips"><span class="sh-hint">读取中…</span></div>
+    <div class="sh-step"><i>3</i>模型</div>
+    <div class="sh-models" id="modelList"><span class="sh-hint">读取中…</span></div>
+    <button class="sh-go" id="createBtn" disabled>创建并打开</button>
+  </div>
+</div>
+<div id="toast"></div>
+
+<script>
+'use strict';
+// ---------------------------------------------------------------- 凭证
+// token 只在扫码那一次出现在 URL 里，必须持久化：刷新、从桌面图标启动、
+// 系统回收后台页面重载，都会丢掉 query。
+const TOKEN_KEY = 'kiro-bridge-token';
+const qs = new URLSearchParams(location.search);
+let TOKEN = qs.get('token') || '';
+if (TOKEN) {
+  try { localStorage.setItem(TOKEN_KEY, TOKEN); } catch (_) {}
+  // 刻意保留 URL 里的 token：外壳页是否需要 token 由 relay 决定，
+  // 而 relay 的改动要等扩展重载才生效。此处抹掉会导致刷新即 401。
+} else {
+  try { TOKEN = localStorage.getItem(TOKEN_KEY) || ''; } catch (_) {}
+}
+const WS_URL = (location.protocol === 'https:' ? 'wss://' : 'ws://') +
+  location.host + '/?token=' + encodeURIComponent(TOKEN);
+
+// ---------------------------------------------------------------- 状态
+const el = (id) => document.getElementById(id);
+const mainEl = el('main'), dotEl = el('dot'), titleEl = el('title'), subEl = el('sub');
+let ws = null, reconnectDelay = 800, reqSeq = 1, failStreak = 0;
+let sessions = [], view = 'list', openId = null, openTitle = '';
+let sessionsSig = '', searchQ = '';
+let lastStatus = { state: 'idle', running: 0, waiting: 0 };
+/** 进入会话前所在的页面，决定返回键回到哪里 */
+let chatFrom = 'list';
+
+const ARCHIVED_KEY = 'kiro-bridge-archived';
+const SHOW_EMPTY_KEY = 'kiro-bridge-show-empty';
+function loadArchived() {
+  try {
+    const v = JSON.parse(localStorage.getItem(ARCHIVED_KEY) || '[]');
+    return new Set(Array.isArray(v) ? v : []);
+  } catch (_) { return new Set(); }
+}
+let archived = loadArchived();
+const saveArchived = () => {
+  try { localStorage.setItem(ARCHIVED_KEY, JSON.stringify([...archived])); } catch (_) {}
+};
+let showEmpty = (() => {
+  try { return localStorage.getItem(SHOW_EMPTY_KEY) === '1'; } catch (_) { return false; }
+})();
+const setShowEmpty = (v) => {
+  showEmpty = v;
+  try { localStorage.setItem(SHOW_EMPTY_KEY, v ? '1' : '0'); } catch (_) {}
+};
+
+/** 空会话：messages.jsonl 为 0 字节。实测这类会话标题恒为 New Session。 */
+const isEmpty = (s) => !s.bytes;
+const esc = (s) => String(s == null ? '' : s)
+  .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+
+/**
+ * 实时状态。后端算好的 s.live 优先。
+ * 后端还没更新（扩展未重载）时降级推断：session.json 的 status 是最后一次写入的
+ * 快照，会话被中断会永久停在 in_progress，所以必须叠加时间窗才能用。
+ */
+function liveOf(s) {
+  if (s.live) return s.live;
+  const age = Date.now() - (s.lastActiveAt || 0);
+  if (s.status === 'waiting_on_user' && age < 30 * 60 * 1000) return 'waiting';
+  if (s.status === 'in_progress' && age < 3 * 60 * 1000) return 'running';
+  return 'idle';
+}
+/** 排序权重：待确认最前（需要你动手），其次运行中，其余按最近活动 */
+const rankOf = (s) => ({ waiting: 0, running: 1 }[liveOf(s)] ?? 2);
+
+function visible() {
+  const q = searchQ.trim().toLowerCase();
+  return sessions
+    .filter((s) => {
+      if (archived.has(s.sessionId)) return false;
+      if (!showEmpty && isEmpty(s)) return false;
+      if (q && !(s.title || '').toLowerCase().includes(q)) return false;
+      return true;
+    })
+    .sort((a, b) => (rankOf(a) - rankOf(b)) || (b.lastActiveAt - a.lastActiveAt));
+}
+
+// ---------------------------------------------------------------- 工具
+function toast(text, onTap) {
+  const t = el('toast');
+  t.textContent = text;
+  t.classList.add('on');
+  t.style.pointerEvents = onTap ? 'auto' : 'none';
+  t.onclick = onTap ? () => { t.classList.remove('on'); t.onclick = null; onTap(); } : null;
+  clearTimeout(toast._h);
+  toast._h = setTimeout(() => { t.classList.remove('on'); t.onclick = null; },
+    onTap ? 4200 : 1800);
+}
+
+function send(type, extra) {
+  if (!ws || ws.readyState !== 1) { toast('未连接'); return null; }
+  const reqId = 'r' + (reqSeq++);
+  ws.send(JSON.stringify(Object.assign({ type, reqId }, extra || {})));
+  return reqId;
+}
+
+function fmtTime(ts) {
+  if (!ts) return '';
+  const d = new Date(ts);
+  if (isNaN(d)) return '';
+  const now = new Date();
+  const diff = (now - d) / 1000;
+  const hm = `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
+  if (diff < 60) return '刚刚';
+  if (diff < 3600) return `${Math.floor(diff / 60)} 分钟前`;
+  if (d.toDateString() === now.toDateString()) return hm;
+  const y = new Date(now - 86400000);
+  if (d.toDateString() === y.toDateString()) return `昨天 ${hm}`;
+  if (d.getFullYear() === now.getFullYear()) return `${d.getMonth() + 1}/${d.getDate()}`;
+  return `${d.getFullYear()}/${d.getMonth() + 1}/${d.getDate()}`;
+}
+
+const shortModel = (m) => String(m || '')
+  .replace(/^claude-/, '').replace(/-latest$/, '');
+
+// ---------------------------------------------------------------- 列表
+function renderList(keepScroll) {
+  view = 'list';
+  openId = null;
+  el('back').classList.add('hide');
+  el('searchBtn').classList.remove('hide');
+  el('newBtn').classList.remove('hide');
+  el('composer').classList.add('hide');
+  el('pend').classList.add('hide');
+
+  const list = visible();
+  titleEl.textContent = 'Kiro Remote';
+  // 统计自己算，不用后端的 status 聚合：扩展重载前后端仍按旧判据计数
+  const runN = list.filter((s) => liveOf(s) === 'running').length;
+  const waitN = list.filter((s) => liveOf(s) === 'waiting').length;
+  const bits = [`${list.length} 个会话`];
+  if (waitN) bits.push(`${waitN} 待确认`);
+  if (runN) bits.push(`${runN} 运行中`);
+  subEl.textContent = bits.join(' · ');
+  subEl.classList.remove('hide');
+  dotEl.className = 'dot' + (waitN ? ' waiting' : runN ? ' running' : '');
+
+  const emptyN = sessions.filter(isEmpty).length;
+  const archN = sessions.filter((s) => archived.has(s.sessionId)).length;
+  const chips = [];
+  if (emptyN) {
+    chips.push(`<button class="chip${showEmpty ? ' on' : ''}" data-f="empty">空会话 ${emptyN}</button>`);
+  }
+  if (archN) chips.push(`<button class="chip" data-f="arch">已归档 ${archN} ›</button>`);
+  const fbar = chips.length
+    ? `<div class="fbar"><span class="sp">${chips.join('')}</span></div>`
+    : '';
+
+  // 扁平列表。按 workspace 分组会破坏「活跃置顶」——组内排序、组间按插入顺序，
+  // 在跑的会话可能落到下面的分组里。workspace 降级成卡片上的一个标签。
+  const parts = [fbar];
+  for (const s of list) {
+    // 只标注真正需要注意的两种状态。已完成 / 失败 / 空闲一律不给标记 ——
+    // 大多数会话都处于这些状态，标出来只是噪音。
+    const live = liveOf(s);
+    const label = { running: '运行中', waiting: '待确认' }[live] || '';
+    parts.push(
+      `<div class="sw" data-id="${esc(s.sessionId)}">
+         <div class="sw-act"><svg><use href="#ic-archive"/></svg></div>
+         <div class="card${label ? ' s-' + live : ''}">
+           <div class="bar"></div>
+           <div class="ttl">${esc(s.title)}</div>
+           <div class="meta">
+             <span class="t">${fmtTime(s.lastActiveAt)}</span>
+             ${s.workspaceName ? `<span class="sep">·</span><span class="ws">${esc(s.workspaceName)}</span>` : ''}
+             ${s.modelId ? `<span class="sep">·</span><span class="model">${esc(shortModel(s.modelId))}</span>` : ''}
+             ${s.agentMode === 'spec' ? `<span class="sep">·</span><span>spec</span>` : ''}
+             ${label ? `<span class="badge ${live}">${label}</span>` : ''}
+           </div>
+         </div>
+       </div>`
+    );
+  }
+  if (!list.length) {
+    parts.push(`<div class="empty">${searchQ ? '没有匹配的会话' :
+      '这里没有会话<br>可以点上面的筛选看看被折叠的部分'}</div>`);
+  }
+
+  const y = keepScroll ? mainEl.scrollTop : 0;
+  mainEl.innerHTML = parts.join('');
+  mainEl.scrollTop = y;
+
+  mainEl.querySelectorAll('.chip').forEach((b) => {
+    b.onclick = () => {
+      if (b.dataset.f === 'empty') { setShowEmpty(!showEmpty); renderList(); }
+      else renderArchived();
+    };
+  });
+  mainEl.querySelectorAll('.sw').forEach(bindSwipe);
+}
+
+/**
+ * 左滑手势：跟手位移，松手时按阈值吸附。
+ * 只在水平位移明显大于垂直位移时才接管，否则让页面正常滚动。
+ */
+function bindSwipe(wrap) {
+  const card = wrap.querySelector('.card');
+  const W = 92;           // 归档按钮宽度
+  const OPEN_AT = 40;     // 松手后停在打开位置的阈值
+  const FIRE_AT = 150;    // 直接触发归档的阈值
+  let x0 = 0, y0 = 0, dx = 0, base = 0;
+  let axis = null;        // null 未定 / 'x' 水平 / 'y' 垂直
+  let moved = false;
+
+  const setX = (v, anim) => {
+    card.classList.toggle('anim', !!anim);
+    card.style.transform = `translateX(${v}px)`;
+  };
+
+  wrap.addEventListener('touchstart', (e) => {
+    if (e.touches.length !== 1) return;
+    x0 = e.touches[0].clientX;
+    y0 = e.touches[0].clientY;
+    axis = null;
+    moved = false;
+    base = card.dataset.open === '1' ? -W : 0;
+    card.classList.remove('anim');
+  }, { passive: true });
+
+  wrap.addEventListener('touchmove', (e) => {
+    if (e.touches.length !== 1) return;
+    const cx = e.touches[0].clientX - x0;
+    const cy = e.touches[0].clientY - y0;
+    if (axis === null) {
+      if (Math.abs(cx) < 6 && Math.abs(cy) < 6) return;
+      axis = Math.abs(cx) > Math.abs(cy) * 1.4 ? 'x' : 'y';
+    }
+    if (axis !== 'x') return;
+    moved = true;
+    dx = base + cx;
+    if (dx > 0) dx = dx * 0.25;                    // 右滑阻尼
+    if (dx < -FIRE_AT - 60) dx = -FIRE_AT - 60;    // 左滑上限
+    setX(dx, false);
+  }, { passive: true });
+
+  const finish = () => {
+    if (axis !== 'x' || !moved) return;
+    if (dx <= -FIRE_AT) {
+      setX(-window.innerWidth, true);
+      setTimeout(() => archive(wrap.dataset.id), 160);
+      return;
+    }
+    const open = dx <= -OPEN_AT;
+    card.dataset.open = open ? '1' : '0';
+    setX(open ? -W : 0, true);
+  };
+  wrap.addEventListener('touchend', finish);
+  wrap.addEventListener('touchcancel', finish);
+
+  // 点归档按钮
+  wrap.querySelector('.sw-act').addEventListener('click', (e) => {
+    e.stopPropagation();
+    archive(wrap.dataset.id);
+  });
+  // 点卡片：已划开时先收起，否则进入会话
+  card.addEventListener('click', (e) => {
+    if (moved) { moved = false; return; }
+    if (card.dataset.open === '1') {
+      card.dataset.open = '0';
+      setX(0, true);
+      return;
+    }
+    openSession(wrap.dataset.id);
+  });
+}
+
+function archive(sessionId) {
+  const s = sessions.find((x) => x.sessionId === sessionId);
+  archived.add(sessionId);
+  saveArchived();
+  if (navigator.vibrate) navigator.vibrate(24);
+  renderList(true);
+  toast(`已归档「${(s ? s.title : sessionId).slice(0, 12)}」，点此撤销`, () => {
+    archived.delete(sessionId);
+    saveArchived();
+    renderList(true);
+  });
+}
+
+// ---------------------------------------------------------------- 会话详情
+function openSession(sessionId, from) {
+  chatFrom = from || 'list';
+  const s = sessions.find((x) => x.sessionId === sessionId);
+  openId = sessionId;
+  openTitle = s ? s.title : sessionId;
+  view = 'chat';
+  titleEl.textContent = openTitle;
+  subEl.textContent = s ? `${s.workspaceName} · ${shortModel(s.modelId) || 'default'}` : '';
+  subEl.classList.remove('hide');
+  el('back').classList.remove('hide');
+  el('searchBtn').classList.add('hide');
+  el('newBtn').classList.add('hide');
+  el('searchWrap').classList.add('hide');
+  el('composer').classList.remove('hide');
+  mainEl.innerHTML = '<div class="sys">加载历史…</div>';
+  send('session:open', { sessionId, limit: 400 });
+}
+
+const TOOL_ICON = { execute: '❯', edit: '✎', read: '◉', search: '⌕', fetch: '↓',
+  delete: '✕', other: '⚙' };
+
+/**
+ * 极小的内联 markdown：**加粗** 与 `行内代码`。
+ * 顺序上先 esc 再替换，保证标记只可能来自模型输出的语法，不可能来自注入的 HTML。
+ * 只做这两种 —— 它们占了实际输出里的绝大多数，块级语法（表格/列表）留给后续。
+ */
+function mdInline(s) {
+  return esc(String(s == null ? '' : s))
+    .replace(/`([^`\n]+)`/g, '<code>$1</code>')
+    .replace(/\*\*(?=\S)([^*\n]+?)\*\*/g, '<strong>$1</strong>');
+}
+
+/** 思考耗时（秒）。算不出来返回 0，不编一个假数字。 */
+function thinkSecs(startTs, endTs) {
+  const a = startTs ? Date.parse(startTs) : NaN;
+  const b = endTs ? Date.parse(endTs) : NaN;
+  if (!a || !b || b < a) return 0;
+  return Math.round((b - a) / 1000);
+}
+
+/**
+ * 把已经结束的思考块收起来。
+ * 数据里没有「思考结束」这个标记，判据只能是「它后面已经出现了别的内容」——
+ * 所以流式期间最后一块保持展开（能看到模型在想什么），一旦有正文或工具跟上就折叠。
+ */
+function settleThinking(scope, keepLastLive) {
+  const blocks = [...scope.querySelectorAll('.think[data-live]')];
+  for (const b of blocks) {
+    // 判据是「它后面还有没有内容」，不是「它是不是最后一块思考」。
+    // 后者会让最近那块一直展开到下一次思考出现为止（实测踩过）。
+    if (keepLastLive && b === scope.lastElementChild) continue;
+    b.removeAttribute('data-live');
+    b.classList.remove('open');
+    const secs = thinkSecs(b.dataset.start, b.dataset.end);
+    const nm = b.querySelector('.nm');
+    const ex = b.querySelector('.ex');
+    if (nm) nm.textContent = 'Thought complete';
+    if (ex) ex.textContent = secs >= 1 ? `${secs}s` : '';
+  }
+}
+
+/**
+ * mux 的实时增量。文件 tail 里思考是整块落盘的（实测 76/76 跨度 0 秒），
+ * 想要真流式只能走这条通路：agent_thought_chunk 是逐块推来的思考。
+ * 这里只认思考，正文仍由 tail 负责 —— 两边都接会让去重复杂一倍。
+ */
+function applyMuxUpdate(params) {
+  if (!params || params.sessionId !== openId) return;
+  const u = params.update;
+  if (!u || u.sessionUpdate !== 'agent_thought_chunk') return;
+  const c = u.content;
+  const text = c && c.type === 'text' ? c.text : '';
+  if (text) streamThought(text);
+}
+
+/** 把一块思考增量追加到「正在思考」的占位块上，没有就新建一个 */
+function streamThought(text) {
+  const atBottom = mainEl.scrollHeight - mainEl.scrollTop - mainEl.clientHeight < 140;
+  let block = mainEl.lastElementChild;
+  const live = block && block.classList.contains('think') && block.dataset.stream;
+  if (!live) {
+    const now = new Date().toISOString();
+    const holder = document.createElement('div');
+    holder.innerHTML = nodeFor({ kind: 'reasoning', text: '', startTs: now, ts: now });
+    block = holder.firstElementChild;
+    block.dataset.stream = '1';
+    mainEl.appendChild(block);
+    bindTools(mainEl);
+  }
+  block.querySelector('.bd').textContent += text;
+  block.dataset.end = new Date().toISOString();
+  if (atBottom) scrollBottom();
+}
+
+/**
+ * 删掉实时占位块。
+ * mux 的实时内容和 tail 的权威内容是同一段文字，会来两次；占位块只负责「正在思考」
+ * 这段体验，权威版本一到就把它撤掉，避免同一段思考出现两遍。
+ */
+function dropStreamPlaceholders() {
+  for (const b of mainEl.querySelectorAll('.think[data-stream]')) b.remove();
+}
+
+function nodeFor(m) {
+  switch (m.kind) {
+    case 'message':
+      return m.role === 'user'
+        ? `<div class="u"><div class="b">${mdInline(m.text)}</div></div>`
+        : `<div class="arow"><span class="ava"><svg><use href="#kiro"/></svg></span>` +
+          `<div class="a">${mdInline(m.text)}</div></div>`;
+    case 'tool': {
+      const ic = TOOL_ICON[m.toolKind] || '⚙';
+      const st = m.status && m.status !== 'completed' && m.status !== 'approved'
+        ? `<span class="st ${esc(m.status)}">${esc(m.status)}</span>` : '';
+      return `<div class="tool">
+          <div class="hd"><span class="caret">▶</span>
+            <span class="nm">${ic} ${esc(m.toolName || m.actionType || 'tool')}</span>
+            <span class="ex">${esc(m.explanation || '')}</span>${st}</div>
+          <div class="bd">${esc(m.preview || '')}</div>
+        </div>`;
+    }
+    // 思考默认折叠：它是给模型自己看的推理，混在正文里会把真正的回答冲掉。
+    // 复用工具卡片的 .tool 结构，折叠交互直接由 bindTools 接管。
+    case 'reasoning':
+      return `<div class="tool think open" data-live="1"
+        data-start="${esc(m.startTs || '')}" data-end="${esc(m.ts || '')}">
+        <div class="hd"><span class="caret">▶</span>
+        <span class="nm">Thinking…</span>
+        <span class="ex"></span></div>
+        <div class="bd">${esc(m.text)}</div></div>`;
+    case 'toolResult':
+      return m.success ? '' : `<div class="err">工具失败：${esc(m.preview)}</div>`;
+    case 'pending':
+      return `<div class="tool"><div class="hd"><span class="caret">▶</span>
+        <span class="nm">⏸ 待确认</span>
+        <span class="ex">${esc(m.question || '')}</span></div>
+        <div class="bd">${esc((m.options || []).map((o) => o.title).join(' / '))}</div></div>`;
+    case 'resolved':
+      return `<div class="sys">已确认：${esc(m.selectedOption || m.outcome)}</div>`;
+    case 'turnEnd':
+      return m.stopReason && m.stopReason !== 'end_turn'
+        ? `<div class="sys">本轮结束：${esc(m.stopReason)}</div>` : '';
+    case 'error':
+      return `<div class="err">${esc(m.text)}</div>`;
+    case 'tombstone':
+      return '<div class="divider">上下文已清理</div>';
+    case 'subAgent':
+      return `<div class="sys">子代理 ${esc(m.phase === 'start' ? '启动' : '结束')}${
+        m.name ? ' · ' + esc(m.name) : ''}${m.error ? ' · ' + esc(m.error) : ''}</div>`;
+    default:
+      return '';
+  }
+}
+
+function bindTools(scope) {
+  scope.querySelectorAll('.tool .hd').forEach((hd) => {
+    if (hd.dataset.bound) return;
+    hd.dataset.bound = '1';
+    hd.onclick = () => hd.parentElement.classList.toggle('open');
+  });
+}
+
+function renderHistory(msgs, truncated) {
+  mainEl.innerHTML = (truncated ? '<div class="divider">仅显示最近部分</div>' : '') +
+    (msgs.map(nodeFor).join('') || '<div class="empty">这个会话还没有内容</div>');
+  // 历史里的思考全部已经结束，一律收起
+  settleThinking(mainEl, false);
+  bindTools(mainEl);
+  scrollBottom();
+}
+
+function appendDelta(msgs) {
+  reconcilePending(msgs);
+  // tail 带来了权威思考，或回合已结束 → 撤掉实时占位，避免同一段思考出现两遍
+  if (msgs.some((m) => m.kind === 'reasoning' || m.kind === 'turnEnd')) dropStreamPlaceholders();
+  const atBottom = mainEl.scrollHeight - mainEl.scrollTop - mainEl.clientHeight < 140;
+  const frag = document.createElement('div');
+  frag.innerHTML = msgs.map(nodeFor).join('');
+  while (frag.firstChild) {
+    const node = frag.firstChild;
+    const last = mainEl.lastElementChild;
+    // 连续的助手片段并进上一段正文，避免刷出一串各带头像的独立块
+    if (node.classList && node.classList.contains('arow') &&
+        last && last.classList.contains('arow')) {
+      // 必须用 innerHTML：正文里已经有 <strong>/<code>，用 textContent 会把标记抹平
+      last.querySelector('.a').innerHTML += node.querySelector('.a').innerHTML;
+      frag.removeChild(node);
+      continue;
+    }
+    // 思考同理：tail 分批到达，不合并会刷出一串各自独立的思考小卡片。
+    // 能走到这里说明上一块还是 live 的（settle 过的后面一定跟了别的类型）。
+    if (node.classList && node.classList.contains('think') &&
+        last && last.classList.contains('think')) {
+      last.querySelector('.bd').textContent += node.querySelector('.bd').textContent;
+      if (node.dataset.end) last.dataset.end = node.dataset.end;
+      frag.removeChild(node);
+      continue;
+    }
+    mainEl.appendChild(node);
+  }
+  // 最后一块思考保持展开（正在想），其余收起
+  settleThinking(mainEl, true);
+  bindTools(mainEl);
+  if (atBottom) scrollBottom();
+}
+
+const scrollBottom = () =>
+  requestAnimationFrame(() => { mainEl.scrollTop = mainEl.scrollHeight; });
+
+// ---------------------------------------------------------------- 待批准
+let pendingItem = null;
+function showPending(p) {
+  pendingItem = p;
+  el('pq').textContent = [p.title, p.detail].filter(Boolean).join('\n') || '需要确认';
+  el('pend').classList.remove('hide');
+  if (navigator.vibrate) navigator.vibrate([40, 60, 40]);
+}
+function hidePending() {
+  pendingItem = null;
+  el('pend').classList.add('hide');
+}
+/**
+ * 授权框对应的请求可能已经在 agent 侧被解决或取消了（实测：不匹配白名单的命令会在
+ * 20ms 内被自动取消）。这时框还挂着，点了也不会生效。结局一到就关掉并说明真实结果，
+ * 不要让「点了没反应」看起来像「点了就好了」。
+ */
+function reconcilePending(msgs) {
+  if (!pendingItem) return;
+  for (const m of msgs || []) {
+    if (m.kind !== 'resolved' || m.toolCallId !== pendingItem.toolCallId) continue;
+    hidePending();
+    toast(
+      m.outcome === 'cancelled'
+        ? '该请求已被取消，批准未生效'
+        : `已确认：${m.selectedOption || m.outcome}`
+    );
+    return;
+  }
+}
+el('pok').onclick = () => {
+  send('session:approve', { sessionId: openId, toolCallId: pendingItem && pendingItem.toolCallId, approve: true });
+  hidePending();
+};
+el('pno').onclick = () => {
+  send('session:approve', { sessionId: openId, toolCallId: pendingItem && pendingItem.toolCallId, approve: false });
+  hidePending();
+};
+
+// ---------------------------------------------------------------- 连接
+function showBlocker(text, hint) {
+  dotEl.className = 'dot off';
+  titleEl.textContent = text;
+  subEl.classList.add('hide');
+  el('composer').classList.add('hide');
+  mainEl.innerHTML = `<div class="empty">${esc(hint)}</div>`;
+}
+
+async function probeAuth() {
+  try {
+    const r = await fetch('api/auth?token=' + encodeURIComponent(TOKEN), { cache: 'no-store' });
+    return r.status;
+  } catch (_) { return 0; }
+}
+
+function connect() {
+  if (!TOKEN) {
+    showBlocker('缺少访问凭证',
+      '这个页面需要扫码进入。\n在 Kiro 里执行「Kiro Bridge: 显示访问地址与二维码」，用手机扫一次。');
+    return;
+  }
+  ws = new WebSocket(WS_URL);
+  ws.onopen = () => { reconnectDelay = 800; failStreak = 0; dotEl.className = 'dot'; };
+  ws.onclose = async () => {
+    dotEl.className = 'dot off';
+    failStreak++;
+    // 连续失败 3 次才探认证：切 App / 锁屏导致的正常断开不该被当成故障
+    if (failStreak >= 3 && (await probeAuth()) === 401) {
+      showBlocker('凭证已失效', 'relay 重启后 token 会变。\n请重新扫一次二维码。');
+      return;
+    }
+    subEl.textContent = `已断开，重连中…（第 ${failStreak} 次）`;
+    subEl.classList.remove('hide');
+    setTimeout(connect, reconnectDelay);
+    reconnectDelay = Math.min(reconnectDelay * 1.6, 8000);
+  };
+  ws.onerror = () => {};
+  ws.onmessage = (ev) => {
+    let m;
+    try { m = JSON.parse(ev.data); } catch (_) { return; }
+    switch (m.type) {
+      case 'sessions': {
+        const next = m.items || [];
+        const sig = next.map((s) =>
+          `${s.sessionId}:${s.lastActiveAt}:${s.status}:${s.bytes}`).join('|');
+        if (sig === sessionsSig) break;
+        sessionsSig = sig;
+        sessions = next;
+        if (view === 'list') renderList(true);
+        else if (view === 'archived') renderArchived();
+        break;
+      }
+      case 'status':
+        // 状态点与计数由 renderList 依据 liveOf 自行判定，这里只记录不直接采用
+        lastStatus = { state: m.state || 'idle', running: m.running || 0, waiting: m.waiting || 0 };
+        break;
+      case 'history':
+        if (m.sessionId === openId) renderHistory(m.messages || [], m.truncated);
+        break;
+      case 'delta':
+        if (m.sessionId === openId) appendDelta(m.messages || []);
+        break;
+      // mux 实时增量：目前只用它做流式思考，正文仍走 tail
+      case 'muxUpdate':
+        applyMuxUpdate(m.params);
+        break;
+      case 'permission':
+        showPending(m);
+        break;
+      case 'sent':
+        toast(m.via === 'mux' ? '已发送' : '已发送（命令通道）');
+        break;
+      // 「已发出」不等于「已被接受」—— 真实结局由 resolved 增量给出，见 reconcilePending
+      case 'approved':
+        toast(m.granularity === 'single' ? '批准已发出' : '批准已发出（整批）');
+        break;
+      case 'workspaces':
+        wsList = m.items || [];
+        renderSheet();
+        break;
+      case 'presets':
+        modeList = m.modes || [];
+        modelList = m.models || [];
+        // m.autopilot 后端仍会返回，前端不用 —— 执行方式沿用会话默认
+        presetDefaults = m.defaults || {};
+        renderSheet();
+        break;
+      case 'created':
+        closeSheet();
+        el('createBtn').textContent = '创建并打开';
+        if (m.failed && m.failed.length) toast(`会话已建，但${m.failed.join('；')}`);
+        else if (m.applied && m.applied.length) toast(`已创建（${m.applied.join(' + ')}已设置）`);
+        else toast('已创建');
+        // 新会话还没进列表，先直接进去；下一次列表推送会带上它
+        if (m.sessionId) {
+          sessions = [{
+            sessionId: m.sessionId, title: '新会话', workspaceName: '',
+            agentMode: 'vibe', status: 'idle', live: 'idle', bytes: 1,
+            lastActiveAt: Date.now(), workspacePaths: m.cwd ? [m.cwd] : [],
+          }, ...sessions];
+          openSession(m.sessionId);
+        }
+        break;
+      case 'error':
+        el('createBtn').disabled = false;
+        el('createBtn').textContent = '创建并打开';
+        toast(m.message || '出错了');
+        break;
+      default:
+        break;
+    }
+  };
+}
+
+// ---------------------------------------------------------------- 新建会话
+// 三项预设各自独立：工作区决定在哪个 IDE 窗口建、模式决定 agent 行为、模型决定用哪个 LLM。
+// 只暴露三项预设。执行方式（Autopilot / Supervised）不在这里选，沿用会话默认值。
+let wsList = [], modeList = [], modelList = [], presetDefaults = {};
+let pickedWs = null, pickedMode = null, pickedModel = null;
+
+function openSheet() {
+  el('sheet').classList.remove('hide');
+  for (const id of ['wsChips', 'modeChips', 'modelList']) {
+    el(id).innerHTML = '<span class="sh-hint">读取中…</span>';
+  }
+  el('createBtn').disabled = true;
+  pickedWs = pickedMode = pickedModel = null;
+  send('workspaces:list');
+  send('presets:list');
+}
+const closeSheet = () => el('sheet').classList.add('hide');
+
+/** 渲染一组 chips，选中项高亮；返回是否有可选项 */
+function renderChips(containerId, items, picked, onPick, emptyHint) {
+  const box = el(containerId);
+  if (!items.length) {
+    box.innerHTML = emptyHint ? `<span class="sh-hint">${esc(emptyHint)}</span>` : '';
+    return false;
+  }
+  box.innerHTML = items.map((it) =>
+    `<button data-id="${esc(it.id)}"${it.id === picked ? ' class="sel"' : ''}>${esc(it.label)}</button>`
+  ).join('');
+  box.querySelectorAll('button').forEach((b) => {
+    b.onclick = () => { onPick(b.dataset.id); renderSheet(); };
+  });
+  return true;
+}
+
+function renderSheet() {
+  if (wsList.length && !pickedWs) pickedWs = wsList[0].path;
+  const hasWs = renderChips(
+    'wsChips',
+    wsList.map((w) => ({ id: w.path, label: w.name })),
+    pickedWs,
+    (v) => { pickedWs = v; },
+    '没有可用工作区。对应的 IDE 窗口需要开着。'
+  );
+
+  // 默认值取 agent 报告的 currentValue，而不是列表第一项
+  if (modeList.length && !pickedMode) {
+    pickedMode = presetDefaults.mode && modeList.some((m) => m.id === presetDefaults.mode)
+      ? presetDefaults.mode : modeList[0].id;
+  }
+  const NEED_RELOAD = '读不到清单。若刚更新过扩展，需要在 Kiro 里执行 Developer: Reload Window。';
+  renderChips('modeChips', modeList, pickedMode, (v) => { pickedMode = v; }, NEED_RELOAD);
+
+  if (modelList.length && !pickedModel) {
+    pickedModel = presetDefaults.model && modelList.some((m) => m.id === presetDefaults.model)
+      ? presetDefaults.model : modelList[0].id;
+  }
+  const mEl = el('modelList');
+  if (!modelList.length) {
+    mEl.innerHTML = `<span class="sh-hint">${esc(NEED_RELOAD)}</span>`;
+  } else {
+    mEl.innerHTML = modelList.map((m) =>
+      `<button data-id="${esc(m.id)}"${m.id === pickedModel ? ' class="sel"' : ''}>` +
+      `<span class="mtxt">${esc(m.label)}` +
+      `${m.rate ? ` <span class="src">${m.rate}x</span>` : ''}` +
+      `${m.source === 'history' ? ' <span class="src">用过</span>' : ''}` +
+      `${m.desc ? `<span class="desc">${esc(m.desc)}</span>` : ''}</span>` +
+      `<span class="tick">✓</span></button>`
+    ).join('');
+    mEl.querySelectorAll('button').forEach((b) => {
+      b.onclick = () => { pickedModel = b.dataset.id; renderSheet(); };
+    });
+  }
+
+  el('createBtn').disabled = !hasWs;
+}
+
+el('newBtn').onclick = openSheet;
+el('shBd').onclick = closeSheet;
+el('createBtn').onclick = () => {
+  el('createBtn').disabled = true;
+  el('createBtn').textContent = '创建中…';
+  send('session:create', {
+    workspacePath: pickedWs, modeId: pickedMode, modelId: pickedModel,
+  });
+};
+
+// ---------------------------------------------------------------- 归档页
+function renderArchived() {
+  view = 'archived';
+  openId = null;
+  titleEl.textContent = '已归档';
+  el('back').classList.remove('hide');
+  el('searchBtn').classList.add('hide');
+  el('newBtn').classList.add('hide');
+  el('searchWrap').classList.add('hide');
+  el('composer').classList.add('hide');
+  el('pend').classList.add('hide');
+  dotEl.className = 'dot';
+
+  const items = sessions
+    .filter((s) => archived.has(s.sessionId))
+    .sort((a, b) => b.lastActiveAt - a.lastActiveAt);
+  subEl.textContent = `${items.length} 个会话 · 只影响这台手机的显示`;
+  subEl.classList.remove('hide');
+
+  if (!items.length) {
+    mainEl.innerHTML = '<div class="empty">没有已归档的会话</div>';
+    return;
+  }
+  mainEl.innerHTML = items.map((s) =>
+    `<div class="arch" data-id="${esc(s.sessionId)}">
+       <div class="arch-main">
+         <div class="ttl">${esc(s.title)}</div>
+         <div class="meta">
+           <span class="t">${fmtTime(s.lastActiveAt)}</span>
+           ${s.workspaceName ? `<span class="sep">·</span><span class="ws">${esc(s.workspaceName)}</span>` : ''}
+           ${s.modelId ? `<span class="sep">·</span><span class="model">${esc(shortModel(s.modelId))}</span>` : ''}
+         </div>
+       </div>
+       <button class="arch-back" data-id="${esc(s.sessionId)}">放回</button>
+     </div>`
+  ).join('') + `<button class="arch-all" id="unarchAll">全部放回（${items.length}）</button>`;
+
+  mainEl.querySelectorAll('.arch-back').forEach((b) => {
+    b.onclick = (e) => { e.stopPropagation(); unarchive(b.dataset.id); };
+  });
+  mainEl.querySelectorAll('.arch-main').forEach((n) => {
+    n.onclick = () => openSession(n.parentElement.dataset.id, 'archived');
+  });
+  el('unarchAll').onclick = () => {
+    const n = archived.size;
+    archived.clear();
+    saveArchived();
+    toast(`已放回 ${n} 个会话`);
+    renderList();
+  };
+}
+
+function unarchive(sessionId) {
+  const s = sessions.find((x) => x.sessionId === sessionId);
+  archived.delete(sessionId);
+  saveArchived();
+  if (navigator.vibrate) navigator.vibrate(20);
+  toast(`已放回「${(s ? s.title : sessionId).slice(0, 12)}」`);
+  if (archived.size) renderArchived();
+  else renderList();
+}
+
+// ---------------------------------------------------------------- 交互
+el('back').onclick = () => {
+  if (view === 'chat' && chatFrom === 'archived' && archived.size) renderArchived();
+  else renderList();
+};
+el('searchBtn').onclick = () => {
+  const w = el('searchWrap');
+  const on = w.classList.toggle('hide');
+  if (!on) el('search').focus();
+  else { searchQ = ''; el('search').value = ''; renderList(); }
+};
+el('search').addEventListener('input', (e) => {
+  searchQ = e.target.value;
+  renderList();
+});
+
+const input = el('input');
+const sendBtn = el('send');
+input.addEventListener('input', () => {
+  input.style.height = 'auto';
+  input.style.height = Math.min(input.scrollHeight, 132) + 'px';
+  sendBtn.disabled = !input.value.trim();
+});
+sendBtn.onclick = () => {
+  const text = input.value.trim();
+  if (!text || !openId) return;
+  send('session:send', { sessionId: openId, text });
+  input.value = '';
+  input.style.height = 'auto';
+  sendBtn.disabled = true;
+};
+
+connect();
+</script>
+</body>
+</html>

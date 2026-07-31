@@ -1,0 +1,77 @@
+{
+  "name": "kiro-remote-bridge",
+  "displayName": "Kiro Remote Bridge",
+  "description": "在手机上浏览与操作 Kiro IDE 的会话：会话列表、历史、流式思维链、发送消息、新建会话",
+  "version": "0.1.7",
+  "publisher": "local",
+  "license": "MIT",
+  "author": "Benny",
+  "keywords": [
+    "kiro",
+    "acp",
+    "remote",
+    "mobile",
+    "websocket"
+  ],
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./src/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "kiroBridge.start",
+        "title": "Kiro Bridge: 启动远程会话"
+      },
+      {
+        "command": "kiroBridge.stop",
+        "title": "Kiro Bridge: 停止远程会话"
+      },
+      {
+        "command": "kiroBridge.showUrl",
+        "title": "Kiro Bridge: 显示访问地址与二维码"
+      },
+      {
+        "command": "kiroBridge.diagnose",
+        "title": "Kiro Bridge: 运行自诊断"
+      },
+      {
+        "command": "kiroBridge.probe",
+        "title": "Kiro Bridge: 探测 agent 方法"
+      },
+      {
+        "command": "kiroBridge.showLog",
+        "title": "Kiro Bridge: 打开日志"
+      }
+    ],
+    "configuration": {
+      "title": "Kiro Remote Bridge",
+      "properties": {
+        "kiroBridge.port": {
+          "type": "number",
+          "default": 3939,
+          "description": "本地 relay 监听端口"
+        },
+        "kiroBridge.bindLan": {
+          "type": "boolean",
+          "default": true,
+          "description": "绑定到局域网地址（关闭则只监听 127.0.0.1）"
+        },
+        "kiroBridge.autoStart": {
+          "type": "boolean",
+          "default": false,
+          "description": "IDE 启动后自动开启远程会话"
+        }
+      }
+    }
+  },
+  "scripts": {
+    "test": "node test/run-all.mjs"
+  }
+}

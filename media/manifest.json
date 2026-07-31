@@ -1,0 +1,19 @@
+{
+  "name": "Kiro Remote",
+  "short_name": "Kiro",
+  "description": "远程浏览与操作 Kiro IDE 的会话",
+  "start_url": "./app.html",
+  "scope": "./",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#111417",
+  "theme_color": "#111417",
+  "icons": [
+    {
+      "src": "icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}
