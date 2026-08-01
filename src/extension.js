@@ -113,6 +113,10 @@ function buildHandlers() {
     'session:open': async (msg) => {
       const sessionId = String(msg.sessionId || '');
       watchedSessionId = sessionId;
+      // 必须订阅：agent 只把权限请求和 session/update 发给已订阅该会话的客户端。
+      // 不订阅的话，电脑侧发起的会话在手机上永远等不到授权框（只能看到从文件读出的
+      // 「待确认」历史卡片，没有按钮），流式思维链也不会有。
+      subscribeSession(sessionId);
       const h = store.readHistory(sessionId, Number(msg.limit) || 400);
       return { type: 'history', ...h };
     },
@@ -180,6 +184,32 @@ function buildHandlers() {
 
     'diagnose': async () => ({ type: 'diagnostics', data: await collectDiagnostics() }),
   };
+}
+
+/**
+ * 让桥订阅某个会话的实时事件。
+ *
+ * 机制已在 Kiro 产物里确认：mux 处理任何带 sessionId 的请求时都会
+ *   subscribeToSession(sessionId, client)
+ * 并且在「此前未订阅」的情况下补发
+ *   resendPendingPermissions() / resendPendingUserInputs()
+ * 所以这里只要发一个**只读**请求、把 sessionId 带过去就够了，不需要专门的订阅方法。
+ *
+ * 选 `_kiro/session/history` 是因为它只从 messageStore 读、不改任何状态，limit=1 足够便宜。
+ * 不 await、失败也不上抛：订阅只影响实时性，历史与状态仍由文件轮询兜住。
+ */
+function subscribeSession(sessionId) {
+  if (!sessionId) return;
+  const conn = muxPool.pickForWorkspace(workspaceOfSession(sessionId));
+  if (!conn) {
+    log(`[subscribe] 没有可用的 mux 连接，${sessionId} 只能靠文件轮询`);
+    return;
+  }
+  conn.request('_kiro/session/history', { sessionId, limit: 1 }).then(
+    () => log(`[subscribe] 已订阅 ${sessionId}（port=${conn.endpoint.port}）`),
+    (err) =>
+      log(`[subscribe] 订阅 ${sessionId} 失败，实时事件收不到: ${err && err.message}`)
+  );
 }
 
 /** 从历史会话里聚合出用过的模型，按出现次数排序。这是确定可用的兜底来源。 */
