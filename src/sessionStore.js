@@ -92,6 +92,8 @@ class SessionStore {
      * 从而在小文件上覆盖「窗口起点切断合并组」这类边界，不必造几 MB 的样本。
      */
     this.historyWindow = HISTORY_WINDOW_BYTES;
+    /** sessionId -> 目录，见 findSessionDir。命中时只做一次 existsSync 校验 */
+    this.dirCache = new Map();
   }
 
   get root() {
@@ -271,11 +273,41 @@ class SessionStore {
     return 'idle';
   }
 
+  /**
+   * 由 sessionId 找到它的目录。
+   *
+   * 原来的写法对经过的**每一个**目录都读一次 session.json，于是查一个会话要解析
+   * O(它在枚举里的位置) 个 JSON 文件 —— 而 tail 每 900ms 就要查一次（现在还要按
+   * 被关注的会话数各查一次）。实测 36 个会话时单次约 3.3ms，其中大部分是这些
+   * 无谓的 JSON 解析；会话只增不减，这个开销会一直长。
+   *
+   * 改动只有「把结果缓存下来」一件事，扫描逻辑一字不动。
+   *
+   * 刻意**不**改成「先把所有目录名扫一遍、再回头读 session.json」——那样看着更快，
+   * 但会改变优先级：原实现是逐个目录先比目录名、再比 meta.id，所以一个「目录名不匹配
+   * 而 meta.id 匹配」的靠前目录会胜过「目录名匹配」的靠后目录。两趟扫会把结果反过来。
+   * 同一个 session id 确实会出现在多个 workspace 目录下（clean-empty-sessions 处理过
+   * 这种情况），这里是决定「读哪个会话的历史」的地方，不值得为了快一点改语义。
+   *
+   * 缓存足够了：冷查一次照旧，之后每 900ms 的 tail 就都是一次 existsSync。
+   */
   findSessionDir(sessionId) {
+    if (!sessionId) return null;
+    const cached = this.dirCache.get(sessionId);
+    if (cached) {
+      if (fs.existsSync(cached)) return cached;
+      this.dirCache.delete(sessionId); // 目录已被删除或移动，重新找一遍
+    }
     for (const dir of this.listSessionDirs()) {
-      if (path.basename(dir) === sessionId) return dir;
+      if (path.basename(dir) === sessionId) {
+        this.dirCache.set(sessionId, dir);
+        return dir;
+      }
       const meta = safeReadJson(path.join(dir, 'session.json'));
-      if (meta && meta.id === sessionId) return dir;
+      if (meta && meta.id === sessionId) {
+        this.dirCache.set(sessionId, dir);
+        return dir;
+      }
     }
     return null;
   }

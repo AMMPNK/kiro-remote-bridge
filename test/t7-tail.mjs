@@ -209,6 +209,76 @@ check('tail 带回最新 status', d.status === 'in_progress', d.status);
   check('小窗口回读后 tail 仍为空', cur.tail('sess_window').messages.length === 0);
 }
 
+// 12. findSessionDir 的缓存不能改变查找语义
+// 缓存本身很简单，风险全在语义上：同一个 session id 会出现在多个 workspace 目录下，
+// 而这里决定「读哪个会话的历史」。原实现是逐个目录先比目录名、再比 meta.id，
+// 所以「meta.id 匹配的靠前目录」胜过「目录名匹配的靠后目录」。
+{
+  const cacheRoot = path.join(root, 'cache-test');
+  const mk = (rel, id) => {
+    const d = path.join(cacheRoot, rel);
+    fs.mkdirSync(d, { recursive: true });
+    if (id !== undefined) {
+      fs.writeFileSync(path.join(d, 'session.json'), JSON.stringify({ id, status: 'idle' }));
+    }
+    fs.writeFileSync(path.join(d, 'messages.jsonl'), '');
+    return d;
+  };
+
+  // 场景一：两个目录同名（同一 id 出现在两个 workspace 下）→ 必须返回枚举里第一个
+  const dupA = mk('wsA/sess_dup', 'sess_dup');
+  const dupB = mk('wsB/sess_dup', 'sess_dup');
+  // 场景二：靠前目录靠 meta.id 匹配，靠后目录靠目录名匹配 → 原实现返回靠前那个
+  const byMeta = mk('wsA/oddly-named', 'sess_pref');
+  const byName = mk('wsB/sess_pref', 'sess_other');
+
+  class OrderedStore extends SessionStore {
+    constructor(dirs) { super(() => {}); this._dirs = dirs; }
+    get root() { return cacheRoot; }
+    listSessionDirs() { return this._dirs; }
+  }
+
+  const s1 = new OrderedStore([dupA, dupB]);
+  const firstCold = s1.findSessionDir('sess_dup');
+  const firstWarm = s1.findSessionDir('sess_dup');
+  check('同名目录：返回枚举里第一个，且缓存不改变结果',
+    firstCold === dupA && firstWarm === dupA, `${path.basename(path.dirname(firstCold))}`);
+
+  const s2 = new OrderedStore([byMeta, byName]);
+  const prefCold = s2.findSessionDir('sess_pref');
+  s2.dirCache.clear();
+  const prefRecold = s2.findSessionDir('sess_pref');
+  const prefWarm = s2.findSessionDir('sess_pref');
+  check('meta.id 匹配的靠前目录胜过目录名匹配的靠后目录',
+    prefCold === byMeta && prefRecold === byMeta && prefWarm === byMeta,
+    `得到 ${prefCold === byMeta ? 'byMeta(正确)' : path.basename(prefCold || 'null')}`);
+
+  // 目录被删掉之后，缓存必须失效并重新查
+  const gone = mk('wsC/sess_gone', 'sess_gone');
+  const s3 = new OrderedStore([gone]);
+  check('删除前能查到', s3.findSessionDir('sess_gone') === gone);
+  fs.rmSync(gone, { recursive: true, force: true });
+  s3._dirs = [];
+  check('目录被删后缓存失效并返回 null', s3.findSessionDir('sess_gone') === null);
+
+  // 目录换了位置：缓存要跟着换，不能一直指着旧路径
+  const moved1 = mk('wsD/sess_move', 'sess_move');
+  const s4 = new OrderedStore([moved1]);
+  check('移动前查到旧位置', s4.findSessionDir('sess_move') === moved1);
+  fs.rmSync(moved1, { recursive: true, force: true });
+  const moved2 = mk('wsE/sess_move', 'sess_move');
+  s4._dirs = [moved2];
+  check('移动后查到新位置', s4.findSessionDir('sess_move') === moved2,
+    `得到 ${path.basename(path.dirname(s4.findSessionDir('sess_move') || 'x'))}`);
+
+  // 查不到的 id 不应写进缓存，否则下次会拿到 undefined 却当成命中
+  const s5 = new OrderedStore([dupA]);
+  check('查不到的 id 返回 null 且不污染缓存',
+    s5.findSessionDir('sess_nope') === null && !s5.dirCache.has('sess_nope'));
+  check('空 sessionId 直接返回 null', s5.findSessionDir('') === null &&
+    s5.findSessionDir(undefined) === null);
+}
+
 fs.rmSync(root, { recursive: true, force: true });
 console.log(`\n结果: ${pass} 通过 / ${fail} 失败`);
 process.exit(fail ? 1 : 0);
