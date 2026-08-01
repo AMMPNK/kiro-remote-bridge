@@ -262,12 +262,26 @@ function modelsFromHistory() {
 
 // parseConfigOptions 已抽到 ./presets（顶部 require 引入），此处不再重复定义。
 
-function writeDiagFile(name, data, mode) {
+/**
+ * 往 ~/.kiro-bridge 写一个诊断文件。
+ *
+ * 权限默认 0600，而不是「调用方记得传 mode 才收紧」。之前是后者，结果只有 token 与
+ * mux 端点两个文件是 0600，而 agent-probe.json（36 条会话标题 + 工作区绝对路径）和
+ * diagnostics.json（最新会话标题、局域网 IP）落在 0644 —— 同一个目录里，敏感度相当，
+ * 保护程度却取决于有没有人在调用处想起这件事。
+ *
+ * 目录本身也收成 0700：文件权限对了但目录可列举，等于把文件名和存在性白送出去。
+ */
+function writeDiagFile(name, data, mode = 0o600) {
   try {
-    fs.mkdirSync(DIAG_DIR, { recursive: true });
+    fs.mkdirSync(DIAG_DIR, { recursive: true, mode: 0o700 });
+    // mkdirSync 的 mode 只对「这次真的创建了目录」生效；目录已存在时它什么都不做，
+    // 所以老用户升级上来仍是旧权限。显式 chmod 一次，让新老装机收敛到同一状态。
+    try { fs.chmodSync(DIAG_DIR, 0o700); } catch (_) { /* 非 POSIX 文件系统上可忽略 */ }
     const p = path.join(DIAG_DIR, name);
     fs.writeFileSync(p, JSON.stringify(data, null, 2), 'utf8');
-    if (mode !== undefined) fs.chmodSync(p, mode);
+    // writeFileSync 对已存在的文件不改权限，所以每次都显式设一遍
+    fs.chmodSync(p, mode);
     return true;
   } catch (err) {
     log(`[diag] 写 ${name} 失败: ${err && err.message}`);
@@ -807,14 +821,10 @@ async function collectDiagnostics() {
       : null,
   };
   log('[diagnose] ' + JSON.stringify(data, null, 2));
-  // 同时落盘：输出面板的内容没法被外部读取，落盘才能在 IDE 之外核对结果
-  try {
-    fs.mkdirSync(DIAG_DIR, { recursive: true });
-    fs.writeFileSync(DIAG_FILE, JSON.stringify(data, null, 2), 'utf8');
-    log(`[diagnose] 已写入 ${DIAG_FILE}`);
-  } catch (err) {
-    log(`[diagnose] 写入失败: ${err && err.message}`);
-  }
+  // 同时落盘：输出面板的内容没法被外部读取，落盘才能在 IDE 之外核对结果。
+  // 走 writeDiagFile 而不是自己 writeFileSync —— 这里原本是第二条写盘路径，于是
+  // 「DIAG_DIR 下的文件怎么落」有了两份实现，收紧权限时只改到了一份。
+  if (writeDiagFile('diagnostics.json', data)) log(`[diagnose] 已写入 ${DIAG_FILE}`);
   return data;
 }
 
@@ -1010,22 +1020,33 @@ function activate(context) {
     vscode.commands.registerCommand('kiroBridge.showLog', () => output.show(true))
   );
 
-  if (vscode.workspace.getConfiguration('kiroBridge').get('autoStart', false)) {
+  const cfg = vscode.workspace.getConfiguration('kiroBridge');
+  if (cfg.get('autoStart', false)) {
     setTimeout(() => start(context).catch((e) => log(`自动启动失败: ${e && e.message}`)), 4000);
-  } else {
-    // 激活后自动跑一次只读诊断并落盘：这是「扩展确实被加载了」的唯一外部证据，
-    // 也顺便探明 mux 的真实可用面。不起 relay、不发任何写操作。
+  } else if (cfg.get('debugProbeOnStartup', false)) {
+    /*
+     * 激活后自动跑一次只读诊断并落盘。默认关闭。
+     *
+     * 这段原本是无条件执行的，理由是「这是扩展确实被加载了的唯一外部证据」—— 那是开发期
+     * 的需求，不该长期挂在所有人的启动路径上。它的实际代价是：用户从没启动过 bridge，
+     * 扩展也已经连上全部 agent mux、发了 4 个 RPC、把 mux token 落盘。而且 mux 端点是
+     * 全窗口共享的，N 个窗口会各自连上全部 N 个端点。
+     *
+     * 同样的事 kiroBridge.probe 命令随时能做一次，所以这里不需要默认打开。
+     */
     setTimeout(() => {
       muxPool
         .refresh()
         .then(async () => {
           await collectDiagnostics();
           writeEndpoints();
-          // 顺带探一遍 agent 的方法面，结果落盘。都是只读调用。
           await probeAgent();
         })
         .catch((e) => log(`启动自诊断失败: ${e && e.message}`));
     }, 5000);
+  } else {
+    // 不做任何主动连接。「扩展被加载了」这件事由输出面板首行日志证明，够用了。
+    log('已就绪，等待 kiroBridge.start（启动自诊断已关闭，需要时开 kiroBridge.debugProbeOnStartup）');
   }
 }
 

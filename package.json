@@ -71,6 +71,11 @@
           "type": "boolean",
           "default": false,
           "description": "IDE 启动后自动开启远程会话"
+        },
+        "kiroBridge.debugProbeOnStartup": {
+          "type": "boolean",
+          "default": false,
+          "markdownDescription": "激活后自动跑一次只读诊断，把 mux 端点（含 token）与 agent 方法探测结果写入 `~/.kiro-bridge/`。仅本机排障用；关闭时扩展在你执行 `Kiro Bridge: 启动` 之前不会连接 agent。同样的事可以随时用 `Kiro Bridge: 探测 agent 方法` 命令做一次。"
         }
       }
     }
