@@ -335,7 +335,14 @@
       管理器，而各家行为还不一致。分成两个 input 后，「文件」这条路是确定的。
     -->
     <input type="file" id="file" class="hide" multiple accept="image/*">
-    <input type="file" id="doc" class="hide" multiple>
+    <!--
+      文件入口刻意排除 image/audio/video。Android 按 accept 去匹配「能提供该类型内容」的
+      应用：只要沾了媒体类型，相机 / 录音 / 相册就会占满选择面板，文件管理被挤进「更多」。
+      不写 accept 也一样（等于 */*，媒体应用照样匹配）—— 实测过，那正是原来的问题。
+      只留 text/* 与 application/* 时，系统才会直接落到文档选择器。
+    -->
+    <input type="file" id="doc" class="hide" multiple
+      accept="text/*,application/*,.md,.log,.csv,.json,.yaml,.yml,.py,.js,.ts,.sh,.sql,.xml,.toml,.ipynb">
   </footer>
 </div>
 <div id="sheet" class="hide">
