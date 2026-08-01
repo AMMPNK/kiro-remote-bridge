@@ -2,7 +2,7 @@
   "name": "kiro-remote-bridge",
   "displayName": "Kiro Remote Bridge",
   "description": "在手机上浏览与操作 Kiro IDE 的会话：会话列表、历史、流式思维链、发送消息、新建会话",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "publisher": "local",
   "license": "MIT",
   "author": "AMMPNK",

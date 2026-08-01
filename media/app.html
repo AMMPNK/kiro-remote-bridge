@@ -286,11 +286,18 @@
   <footer id="composer" class="hide">
     <div class="atts hide" id="atts"></div>
     <div class="cmp">
-      <button class="attbtn" id="attach" aria-label="添加文件">＋</button>
+      <button class="attbtn" id="attachImg" aria-label="添加图片">🖼</button>
+      <button class="attbtn" id="attach" aria-label="添加文件">📎</button>
       <textarea id="input" rows="1" placeholder="发消息…"></textarea>
       <button class="sendbtn" id="send" disabled aria-label="发送">↑</button>
     </div>
-    <input type="file" id="file" class="hide" multiple>
+    <!--
+      两个入口而不是一个：Android 上 input[type=file] 不带 accept 时，多数浏览器会弹
+      「相机 / 录音 / 照片和视频 / 更多」这种媒体优先面板，文件要点进「更多」才能到文件
+      管理器，而各家行为还不一致。分成两个 input 后，「文件」这条路是确定的。
+    -->
+    <input type="file" id="file" class="hide" multiple accept="image/*">
+    <input type="file" id="doc" class="hide" multiple>
   </footer>
 </div>
 <div id="sheet" class="hide">
@@ -1242,6 +1249,7 @@ function syncSendState() {
 }
 
 async function addFiles(files) {
+  const before = atts.length;
   for (const f of files) {
     try {
       const isImg = (f.type || '').startsWith('image/');
@@ -1270,14 +1278,21 @@ async function addFiles(files) {
   }
   renderAtts();
   syncSendState();
+  // 成功也要有反馈：选了文件却什么都没出现时，得能分清是选择器没给、还是这里把它丢了
+  const added = atts.length - before;
+  if (added > 0) toast(`已添加 ${added} 个附件`);
+  else if (files.length) toast('一个都没加上，可能超限或格式不支持');
 }
 
-el('attach').onclick = () => el('file').click();
-el('file').onchange = async (e) => {
+const onPicked = async (e) => {
   const files = [...(e.target.files || [])];
   e.target.value = '';
   if (files.length) await addFiles(files);
 };
+el('attachImg').onclick = () => el('file').click();
+el('attach').onclick = () => el('doc').click();
+el('file').onchange = onPicked;
+el('doc').onchange = onPicked;
 
 input.addEventListener('input', () => {
   input.style.height = 'auto';
