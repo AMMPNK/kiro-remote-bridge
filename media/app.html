@@ -444,7 +444,6 @@ let sessions = [], view = 'list', openId = null, openTitle = '';
  */
 let turnActive = false, lastSendAt = 0;
 let sessionsSig = '', searchQ = '';
-let lastStatus = { state: 'idle', running: 0, waiting: 0 };
 /** 进入会话前所在的页面，决定返回键回到哪里 */
 let chatFrom = 'list';
 
@@ -1214,9 +1213,9 @@ function connect() {
         if (view === 'chat') syncTurnFromList();
         break;
       }
+      // 刻意不采用：状态点与计数由 renderList 依据 liveOf 自己算，因为扩展重载之前
+      // 后端仍按旧判据计数，两边会对不上。这里收下但不用，避免出现两个事实源。
       case 'status':
-        // 状态点与计数由 renderList 依据 liveOf 自行判定，这里只记录不直接采用
-        lastStatus = { state: m.state || 'idle', running: m.running || 0, waiting: m.waiting || 0 };
         break;
       case 'history':
         if (m.sessionId === openId) renderHistory(m.messages || [], m.truncated);

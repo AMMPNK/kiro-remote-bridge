@@ -28,12 +28,8 @@ const DIAG_DIR = path.join(os.homedir(), '.kiro-bridge');
 const DIAG_FILE = path.join(DIAG_DIR, 'diagnostics.json');
 /** agent 方法探测结果：把原始返回落盘，便于在扩展之外核对结构 */
 const PROBE_FILE = path.join(DIAG_DIR, 'agent-probe.json');
-/**
- * mux 端点（含 token）落盘，权限 0600，仅用于本机调试。
- * 有它才能在扩展之外直接连 agent 试方法，不必为每次试错重载一遍 IDE。
- * 不需要时删掉这个文件即可；relay 重启后 token 也会变。
- */
-const ENDPOINTS_FILE = path.join(DIAG_DIR, 'mux-endpoints.json');
+// mux 端点文件的说明见 writeEndpoints()。这里原来有一个 ENDPOINTS_FILE 常量，
+// 在改成走 writeDiagFile(name, …) 之后就没人用了。
 /**
  * 模型清单缓存。
  *
@@ -142,7 +138,6 @@ function buildHandlers() {
       conn.sendJson({ type: 'status', ...store.aggregateStatus(), mux: muxSummary() });
     },
 
-    'sessions:list': async () => ({ type: 'sessions', items: store.listSessions() }),
 
     'session:open': async (msg, conn) => {
       const sessionId = String(msg.sessionId || '');
@@ -218,8 +213,9 @@ function buildHandlers() {
       }
       return { type: 'workspaces', items: out };
     },
-
-    'diagnose': async () => ({ type: 'diagnostics', data: await collectDiagnostics() }),
+    // 这里原来还有一个 'diagnose' handler，前端从不调用。删掉的理由不只是死代码：
+    // 它会把 store 根路径、会话标题、mux 端口、局域网地址整份返回给手机端，
+    // 而同样的东西命令面板里的 kiroBridge.diagnose 随时能看。少一个入口少一份暴露面。
   };
 }
 
@@ -397,7 +393,13 @@ async function probeAgent() {
   return out;
 }
 
-/** 落盘 mux 端点（含 token），仅本机调试用，权限 0600 */
+/**
+ * 落盘 mux 端点（含 token）到 ~/.kiro-bridge/mux-endpoints.json，权限 0600，仅本机调试用。
+ *
+ * 有它才能在扩展之外直接连 agent 试方法，不必为每次试错重载一遍 IDE。
+ * 不需要时删掉这个文件即可；relay 重启后 token 也会变。
+ * 注意这个函数只在 kiroBridge.probe 命令、或显式打开 debugProbeOnStartup 时才会被调用。
+ */
 function writeEndpoints() {
   const eps = [];
   for (const [port, c] of muxPool.connections) {

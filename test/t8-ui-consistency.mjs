@@ -100,10 +100,16 @@ check('前端发送的消息类型都有 handler', unknownTypes.length === 0,
 // 不能是事实源的副本。
 const handled = new Set([...script.matchAll(/case '([a-zA-Z]+)':/g)].map((m) => m[1]));
 const relaySrc = readFileSync(join(ROOT, 'src', 'relay.js'), 'utf8');
-/** 前端刻意不进 switch 的类型，必须写明理由；新类型默认要求被处理（fail-closed） */
-const NOT_IN_SWITCH = new Map([
-  ['diagnostics', '自诊断应答，只在开发时查看，前端不请求'],
-]);
+/**
+ * 前端刻意不进 switch 的类型，必须写明理由；新类型默认要求被处理（fail-closed）。
+ *
+ * 现在是空的 —— 三条豁免全部消化掉了，而且每一条都不是靠「补一个空 handler」消化的：
+ *   cancelled    前端本来就该能发 session:cancel，豁免掩盖的是一个功能缺口
+ *   hello        前端本来就该读握手里的 maxPayload，豁免掩盖的是一份写死的副本
+ *   diagnostics  后端本来就不该把这份数据开给手机端，handler 已删除
+ * 空表是这条门禁的正常状态。往里加东西之前，先确认要加的不是上面那三种情况之一。
+ */
+const NOT_IN_SWITCH = new Map();
 // 只认真正发往手机的出口：broadcast(…)、sendJson(…)、handler 的 return / 箭头直接返回。
 // 不能宽泛地抓所有 type: 'x' —— 后端还会构造 ACP 内容块（image / resource / text），
 // 那些不是广播类型，抓进来会让这条门禁误报，进而诱使人给前端加没用的 handler。
