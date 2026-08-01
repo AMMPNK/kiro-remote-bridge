@@ -35,8 +35,18 @@ check('JS 引用的 id 全部真实存在', missingIds.length === 0,
 // 字符串字面量也算作引用，宁可放宽也不要误报。
 const cssIdRefs = new Set([...style.matchAll(/#([a-zA-Z][\w-]*)/g)].map((m) => m[1]));
 const strLiterals = new Set([...script.matchAll(/'([a-zA-Z][\w-]*)'/g)].map((m) => m[1]));
+// <symbol> 可以只被静态 HTML 里的 <use href="#x"> 引用，脚本里根本不出现。
+// 漏掉这类会把在用的图标报成「残留」，进而诱使人把它删掉。
+const markupIdRefs = new Set(
+  [...html.matchAll(/(?:href|xlink:href)="#([a-zA-Z][\w-]*)"/g)].map((m) => m[1])
+);
 const unusedIds = [...allIds].filter(
-  (i) => !refIds.has(i) && !cssIdRefs.has(i) && !strLiterals.has(i) && !script.includes(`#${i}`)
+  (i) =>
+    !refIds.has(i) &&
+    !cssIdRefs.has(i) &&
+    !strLiterals.has(i) &&
+    !markupIdRefs.has(i) &&
+    !script.includes(`#${i}`)
 );
 check('声明的 id 没有无用残留', unusedIds.length === 0,
   unusedIds.length ? `未被引用: ${unusedIds.join(', ')}` : `共 ${allIds.size} 个 id`);
