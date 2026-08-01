@@ -61,6 +61,8 @@ const TAIL_INTERVAL_MS = 900;
  * （会话不存在、已有回合在跑）会在这段时间内回来。
  */
 const SEND_SETTLE_MS = 2000;
+/** viewSession 之后留给桌面加载会话的时间；太短会导致重试仍报 not found */
+const ATTACH_SETTLE_MS = 1500;
 /** 会话列表与状态的刷新间隔 */
 const LIST_INTERVAL_MS = 5000;
 
@@ -208,16 +210,25 @@ function subscribeSession(sessionId) {
     return;
   }
   const port = conn.endpoint.port;
-  conn.request('_kiro/session/history', { sessionId, limit: 1 }).then(
-    () => {
-      subscribedTo = { sessionId, port };
-      log(`[subscribe] 已订阅 ${sessionId}（port=${port}）`);
-    },
-    (err) => {
-      subscribedTo = { sessionId: null, port: null };
-      log(`[subscribe] 订阅 ${sessionId} 失败，实时事件收不到: ${err && err.message}`);
+  const probe = () => conn.request('_kiro/session/history', { sessionId, limit: 1 });
+  const ok = () => {
+    subscribedTo = { sessionId, port };
+    log(`[subscribe] 已订阅 ${sessionId}（port=${port}）`);
+  };
+  probe().then(ok, async (err) => {
+    subscribedTo = { sessionId: null, port: null };
+    // 重启后 agent 不认识旧会话，订阅也会失败。让桌面加载一次再试一遍。
+    if (isSessionUnknown(err)) {
+      log(`[subscribe] agent 不认识 ${sessionId}，先让桌面加载`);
+      await attachDesktop(sessionId);
+      await new Promise((r) => setTimeout(r, ATTACH_SETTLE_MS));
+      probe().then(ok, (e2) =>
+        log(`[subscribe] 加载后仍失败，实时事件收不到: ${e2 && e2.message}`)
+      );
+      return;
     }
-  );
+    log(`[subscribe] 订阅 ${sessionId} 失败，实时事件收不到: ${err && err.message}`);
+  });
 }
 
 /**
@@ -494,23 +505,52 @@ function workspaceOfSession(sessionId) {
 }
 
 /** 发消息：优先 mux 的 session/prompt（可定向到任意会话），失败退回 VS Code 命令 */
+/**
+ * 发一次 prompt 并只观察一小段时间。
+ *
+ * session/prompt 要等整个回合结束才返回，等它就等于把「正在正常处理」判成失败。
+ * 所以只看这段窗口里有没有回错误（例如 A prompt is already in-flight、Session not found），
+ * 没有就当已送达，回合继续在后台跑。返回 null 表示没观察到错误。
+ */
+async function tryPrompt(conn, sessionId, text) {
+  let failure = null;
+  const inflight = conn.sendPrompt(sessionId, text);
+  inflight.then(
+    () => log(`[send] 回合结束 session=${sessionId}`),
+    (err) => {
+      failure = err || new Error('unknown');
+      log(`[send] 回合出错 session=${sessionId}: ${failure.message}`);
+    }
+  );
+  await new Promise((r) => setTimeout(r, SEND_SETTLE_MS));
+  return failure;
+}
+
+/**
+ * 判断错误是否为「agent 不认识这个会话」。
+ *
+ * 重载或窗口重启后，agent 是个新进程，内存里没有旧会话的 state —— 磁盘上文件都在，
+ * 但 session/prompt 与 _kiro/session/history 都会报 Session ... not found。
+ */
+function isSessionUnknown(err) {
+  return /not found|unknown session|no such session/i.test(String((err && err.message) || err));
+}
+
 async function sendToSession(sessionId, text) {
   const wsPath = workspaceOfSession(sessionId);
   const conn = muxPool.pickForWorkspace(wsPath);
   if (conn) {
-    // session/prompt 要等整个回合结束才返回，等它就等于把「正在正常处理」判成失败。
-    // 这里只观察一小段时间：期间回了错误（例如 A prompt is already in-flight）才算发送失败，
-    // 否则就当已送达，回合继续在后台跑。
-    let failure = null;
-    const inflight = conn.sendPrompt(sessionId, text);
-    inflight.then(
-      () => log(`[send] 回合结束 session=${sessionId}`),
-      (err) => {
-        failure = err || new Error('unknown');
-        log(`[send] 回合出错 session=${sessionId}: ${failure.message}`);
-      }
-    );
-    await new Promise((r) => setTimeout(r, SEND_SETTLE_MS));
+    let failure = await tryPrompt(conn, sessionId, text);
+    // agent 不认识这个会话 → 让桌面加载一次再重试。
+    // 不用 ACP 的 session/load：它要求传 mcpServers，传空数组有可能让该会话丢掉 MCP 工具，
+    // 属于会静默降级的副作用；走桌面加载则用它自己的配置。
+    if (failure && isSessionUnknown(failure)) {
+      log('[send] agent 不认识该会话（重启后常见），先让桌面加载一次再重试');
+      await attachDesktop(sessionId);
+      // viewSession 只是把面板切过去，加载是异步的；不留一点时间的话重试仍会 not found
+      await new Promise((r) => setTimeout(r, ATTACH_SETTLE_MS));
+      failure = await tryPrompt(conn, sessionId, text);
+    }
     if (!failure) {
       log(`[send] via mux port=${conn.endpoint.port} session=${sessionId}`);
       return { via: 'mux' };
