@@ -111,9 +111,26 @@
   .ava{flex:0 0 auto;width:22px;height:22px;margin-top:1px}
   .ava svg{width:100%;height:100%;display:block}
   .arow .a{margin:0;flex:1;min-width:0}
-  .a{margin:0 0 14px;font-size:14.5px;line-height:1.62;color:var(--fg2);
-    white-space:pre-wrap;word-break:break-word}
+  /* 块级由 mdRender 生成，所以换行交给段落自己处理，不在容器上开 pre-wrap */
+  .a{margin:0 0 14px;font-size:14.5px;line-height:1.62;color:var(--fg2);word-break:break-word}
   .a strong{color:var(--fg);font-weight:600}
+  .a .pp{margin:0 0 10px;white-space:pre-wrap}
+  .a .pp:last-child{margin-bottom:0}
+  .a .mh{margin:15px 0 8px;color:var(--fg);font-weight:600;font-size:15px}
+  .a .mh:first-child{margin-top:0}
+  .a .ml{margin:0 0 10px;padding-left:19px}
+  .a .ml li{margin:3px 0}
+  .a blockquote{margin:0 0 10px;padding:1px 0 1px 10px;border-left:2px solid var(--line2);
+    color:var(--dim);white-space:pre-wrap}
+  .a .cb{margin:0 0 10px;padding:10px 11px;background:var(--card);border:1px solid var(--line);
+    border-radius:8px;overflow-x:auto}
+  .a .cb code{background:none;border:none;padding:0;font-size:12px;line-height:1.5;
+    white-space:pre;color:var(--fg2)}
+  /* 表格在手机上必然溢出，所以外层单独给一个横向滚动容器 */
+  .a .tw{margin:0 0 10px;overflow-x:auto;-webkit-overflow-scrolling:touch}
+  .a table{border-collapse:collapse;font-size:12.5px}
+  .a th,.a td{border:1px solid var(--line);padding:6px 9px;text-align:left;vertical-align:top}
+  .a th{background:var(--card2);color:var(--fg);font-weight:600;white-space:nowrap}
   /* 行内代码：正文与用户气泡里都可能出现 */
   .a code,.u .b code{font-family:ui-monospace,SFMono-Regular,monospace;font-size:.88em;
     background:var(--card2);border:1px solid var(--line);border-radius:4px;padding:1px 4px;
@@ -691,6 +708,117 @@ function mdInline(s) {
     .replace(/\*\*(?=\S)([^*\n]+?)\*\*/g, '<strong>$1</strong>');
 }
 
+/** 属性里还要转义引号，否则文本里的 " 能从 data-raw 里逃出去 */
+const escAttr = (s) => esc(s).replace(/"/g, '&quot;');
+
+const RE_UL = /^\s*[-*]\s+/;
+const RE_OL = /^\s*\d+\.\s+/;
+const RE_QUOTE = /^\s*>\s?/;
+/** 表格分隔行：必须同时有竖线和横线，否则单独的 --- 会被误判成表格 */
+const RE_TSEP = /^\s*\|?[\s:|-]*-[\s:|-]*\|?\s*$/;
+
+/**
+ * 极小的块级 markdown：表格、代码块、标题、列表、引用，其余按段落走。
+ *
+ * 两个约束决定了写法：
+ *  1. 流式期间会拿**半截文本**反复调用它（代码块可能还没收尾），所以任何未闭合结构都要
+ *     能安全收尾，不能死循环、也不能吞掉后面的内容。
+ *  2. 先 esc 再拼标签，标记只可能来自 markdown 语法，不可能来自模型输出的 HTML。
+ */
+function mdRender(src) {
+  const lines = String(src == null ? '' : src).split('\n');
+  const out = [];
+  let para = [];
+  const flush = () => {
+    if (!para.length) return;
+    out.push('<p class="pp">' + para.map(mdInline).join('\n') + '</p>');
+    para = [];
+  };
+  const cells = (row) =>
+    row
+      .replace(/^\s*\|/, '')
+      .replace(/\|\s*$/, '')
+      .split('|')
+      .map((c) => c.trim());
+
+  let i = 0;
+  while (i < lines.length) {
+    const line = lines[i];
+
+    if (/^\s*```/.test(line)) {
+      flush();
+      const body = [];
+      i++;
+      while (i < lines.length && !/^\s*```\s*$/.test(lines[i])) body.push(lines[i++]);
+      i++; // 收尾 fence；流式时可能还不存在，越界也无妨
+      out.push('<pre class="cb"><code>' + esc(body.join('\n')) + '</code></pre>');
+      continue;
+    }
+
+    const sep = lines[i + 1];
+    if (line.includes('|') && sep && sep.includes('|') && RE_TSEP.test(sep)) {
+      flush();
+      const head = cells(line);
+      i += 2;
+      const rows = [];
+      while (i < lines.length && lines[i].includes('|')) rows.push(cells(lines[i++]));
+      out.push(
+        '<div class="tw"><table><thead><tr>' +
+          head.map((c) => '<th>' + mdInline(c) + '</th>').join('') +
+          '</tr></thead><tbody>' +
+          rows
+            .map((r) => '<tr>' + r.map((c) => '<td>' + mdInline(c) + '</td>').join('') + '</tr>')
+            .join('') +
+          '</tbody></table></div>'
+      );
+      continue;
+    }
+
+    const h = /^(#{1,6})\s+(.*)$/.exec(line);
+    if (h) {
+      flush();
+      out.push('<div class="mh">' + mdInline(h[2]) + '</div>');
+      i++;
+      continue;
+    }
+
+    if (RE_QUOTE.test(line)) {
+      flush();
+      const body = [];
+      while (i < lines.length && RE_QUOTE.test(lines[i])) {
+        body.push(lines[i++].replace(RE_QUOTE, ''));
+      }
+      out.push('<blockquote>' + body.map(mdInline).join('\n') + '</blockquote>');
+      continue;
+    }
+
+    if (RE_UL.test(line) || RE_OL.test(line)) {
+      flush();
+      const ordered = RE_OL.test(line);
+      const re = ordered ? RE_OL : RE_UL;
+      const items = [];
+      while (i < lines.length && re.test(lines[i])) items.push(lines[i++].replace(re, ''));
+      const tag = ordered ? 'ol' : 'ul';
+      out.push(
+        '<' + tag + ' class="ml">' +
+          items.map((t) => '<li>' + mdInline(t) + '</li>').join('') +
+          '</' + tag + '>'
+      );
+      continue;
+    }
+
+    if (line.trim() === '') {
+      flush();
+      i++;
+      continue;
+    }
+    para.push(line);
+    i++;
+  }
+  flush();
+  return out.join('');
+}
+
 /** 思考耗时（秒）。算不出来返回 0，不编一个假数字。 */
 function thinkSecs(startTs, endTs) {
   const a = startTs ? Date.parse(startTs) : NaN;
@@ -755,7 +883,7 @@ function streamSay(text) {
   }
   const body = block.querySelector('.a');
   body.dataset.raw = (body.dataset.raw || '') + text;
-  body.innerHTML = mdInline(body.dataset.raw);
+  body.innerHTML = mdRender(body.dataset.raw);
   if (atBottom) scrollBottom();
 }
 
@@ -799,7 +927,7 @@ function nodeFor(m) {
       return m.role === 'user'
         ? `<div class="u"><div class="b">${mdInline(m.text)}${attNote(m)}</div></div>`
         : `<div class="arow"><span class="ava"><svg><use href="#kiro"/></svg></span>` +
-          `<div class="a">${mdInline(m.text)}</div></div>`;
+          `<div class="a" data-raw="${escAttr(m.text || '')}">${mdRender(m.text)}</div></div>`;
     case 'tool': {
       const ic = TOOL_ICON[m.toolKind] || '⚙';
       const st = m.status && m.status !== 'completed' && m.status !== 'approved'
@@ -884,8 +1012,12 @@ function appendDelta(msgs) {
     // 连续的助手片段并进上一段正文，避免刷出一串各带头像的独立块
     if (node.classList && node.classList.contains('arow') &&
         last && last.classList.contains('arow')) {
-      // 必须用 innerHTML：正文里已经有 <strong>/<code>，用 textContent 会把标记抹平
-      last.querySelector('.a').innerHTML += node.querySelector('.a').innerHTML;
+      // 合并原始文本后整体重渲染，而不是拼 HTML：块级结构（表格、代码块）会被切在两段
+      // 之间，拼 HTML 只会得到两个残缺的表格。
+      const lb = last.querySelector('.a');
+      const nb = node.querySelector('.a');
+      lb.dataset.raw = (lb.dataset.raw || '') + (nb.dataset.raw || '');
+      lb.innerHTML = mdRender(lb.dataset.raw);
       frag.removeChild(node);
       continue;
     }
