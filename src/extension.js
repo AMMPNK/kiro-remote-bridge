@@ -12,6 +12,8 @@ const vscode = require('vscode');
 const path = require('path');
 const fs = require('fs');
 const os = require('os');
+const crypto = require('crypto');
+const { spawn } = require('child_process');
 
 const { SessionStore } = require('./sessionStore');
 const { MuxPool } = require('./muxClient');
@@ -43,6 +45,14 @@ const ENDPOINTS_FILE = path.join(DIAG_DIR, 'mux-endpoints.json');
  * 供之后新建会话时选择，否则只能退回「历史里用过的模型」，清单是不全的。
  */
 const MODELS_FILE = path.join(DIAG_DIR, 'model-options.json');
+/**
+ * 访问 token 落盘位置（权限 0600）。
+ *
+ * 之前 token 是每次启动随机生成的，而它只出现在 Mac 屏幕上的二维码里。后果是：人在外面时
+ * 只要扩展重新激活（重载窗口、Kiro 重启、睡醒后激活），token 就变了，而你拿不到新二维码
+ * —— 直接永久失联，没有自救手段。所以改成持久化，并提供「轮换 token」命令来兜住泄露风险。
+ */
+const TOKEN_FILE = path.join(DIAG_DIR, 'relay-token.json');
 
 /** 活跃会话的 tail 轮询间隔 */
 const TAIL_INTERVAL_MS = 900;
@@ -70,6 +80,10 @@ const pendingPermissions = new Map();
 let modelOptions = [];
 /** 与上面同来源的默认模型，避免自己编一个默认值 */
 let modelCurrent;
+/** caffeinate 子进程，阻止空闲休眠；中继停止时释放 */
+let awake;
+/** activate 时存下来，轮换 token 后要用它重启中继 */
+let extContext;
 
 function log(msg) {
   const ts = new Date().toISOString().slice(11, 23);
@@ -632,6 +646,75 @@ async function collectDiagnostics() {
 
 // ---------------------------------------------------------------- 生命周期
 
+/** 读取持久化的访问 token；没有就生成一个并落盘（0600）。见 TOKEN_FILE 的说明。 */
+function loadOrCreateToken() {
+  try {
+    const raw = JSON.parse(fs.readFileSync(TOKEN_FILE, 'utf8'));
+    if (raw && typeof raw.token === 'string' && raw.token.length >= 32) {
+      log(`[token] 复用已落盘的访问 token（生成于 ${raw.at || '未知时间'}）`);
+      return raw.token;
+    }
+  } catch (_) {
+    /* 首次运行没有这个文件，属正常 */
+  }
+  const token = crypto.randomBytes(32).toString('base64url');
+  writeDiagFile('relay-token.json', { at: new Date().toISOString(), token }, 0o600);
+  log('[token] 已生成新的访问 token 并落盘（0600）');
+  return token;
+}
+
+/** 换一个新 token。持久 token 一旦泄露就长期有效，必须留一条轮换的路。 */
+async function rotateToken() {
+  try {
+    fs.unlinkSync(TOKEN_FILE);
+  } catch (_) {
+    /* 本来就没有也没关系 */
+  }
+  const wasRunning = !!relay;
+  if (wasRunning) await stop();
+  log('[token] 已作废旧 token');
+  if (wasRunning && extContext) {
+    await start(extContext);
+    vscode.window.showInformationMessage('访问 token 已轮换，中继已重启 —— 手机需要重新扫码');
+  } else {
+    vscode.window.showInformationMessage('访问 token 已轮换，下次启动生效');
+  }
+}
+
+/**
+ * 阻止空闲休眠。
+ *
+ * 注意：caffeinate 阻止不了「合盖休眠」—— 合上盖子且没接外接显示器/电源时，系统照样会睡，
+ * 远程访问随之中断。这是系统行为，不是本项目能绕开的，所以要如实写进文档而不是假装解决了。
+ */
+function keepAwake() {
+  if (awake) return;
+  try {
+    awake = spawn('caffeinate', ['-i'], { stdio: 'ignore' });
+    awake.on('exit', () => {
+      awake = null;
+    });
+    awake.on('error', (err) => {
+      awake = null;
+      log(`[awake] caffeinate 启动失败，机器可能会休眠: ${err && err.message}`);
+    });
+    log('[awake] 已抑制空闲休眠（注意：合盖仍会休眠）');
+  } catch (err) {
+    log(`[awake] caffeinate 不可用，机器可能会休眠: ${err && err.message}`);
+  }
+}
+
+function releaseAwake() {
+  if (!awake) return;
+  try {
+    awake.kill();
+  } catch (_) {
+    /* 已经退出了 */
+  }
+  awake = null;
+  log('[awake] 已释放休眠抑制');
+}
+
 async function start(context) {
   if (relay) {
     vscode.window.showInformationMessage('Kiro Bridge 已在运行');
@@ -645,8 +728,11 @@ async function start(context) {
     mediaDir: path.join(context.extensionPath, 'media'),
     log,
     handlers: buildHandlers(),
+    token: loadOrCreateToken(),
   });
   await relay.start(port, bindLan);
+  // 远程访问的前提是机器活着；出门在外没人能去点一下鼠标
+  keepAwake();
 
   const r = await muxPool.refresh();
   log(`[mux] endpoints=${r.endpointCount} 已连接=${r.connectedCount}`);
@@ -659,6 +745,7 @@ async function start(context) {
 
 async function stop() {
   stopPolling();
+  releaseAwake();
   if (relay) {
     relay.stop();
     relay = null;
@@ -709,6 +796,7 @@ document.getElementById('qr').innerHTML = renderQrSvg(${JSON.stringify(lan)}, 6)
 function activate(context) {
   output = vscode.window.createOutputChannel('Kiro Remote Bridge');
   log('扩展已激活');
+  extContext = context;
   loadModelOptions();
 
   store = new SessionStore(log);
@@ -744,6 +832,7 @@ function activate(context) {
         `探测完成：${okN}/${(r.probes || []).length} 个方法可用，结果已写入 ${PROBE_FILE}`
       );
     }),
+    vscode.commands.registerCommand('kiroBridge.rotateToken', () => rotateToken()),
     vscode.commands.registerCommand('kiroBridge.showLog', () => output.show(true))
   );
 
@@ -768,6 +857,8 @@ function activate(context) {
 
 function deactivate() {
   stopPolling();
+  // caffeinate 是子进程，不显式收掉会把休眠一直抑制到它自己退出
+  releaseAwake();
   if (relay) relay.stop();
   if (muxPool) muxPool.dispose();
 }

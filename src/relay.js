@@ -3,7 +3,8 @@
  * 本地 relay：给手机提供 PWA 静态页 + WebSocket 通道。
  *
  * 安全边界（重要）：
- *  - 所有 HTTP 与 WS 入口都强制校验 token；token 是每次启动新生成的随机值。
+ *  - 所有 HTTP 与 WS 入口都强制校验 token。token 由调用方注入（扩展会持久化它，
+ *    否则人在外面遇到一次重启就再也拿不到新二维码）；没注入时退回临时随机值。
  *  - 默认可绑定局域网（手机同 WiFi 直连）。绑 LAN 意味着同网段任何设备都能到达
  *    这个端口，token 是唯一的门；因此 token 用 32 字节随机并做定时比较。
  *  - 不做公网暴露。要外网访问请自行叠加隧道，并清楚那等于把 IDE 控制面放到公网。
@@ -72,7 +73,8 @@ class Relay {
     this.mediaDir = opts.mediaDir;
     this.log = opts.log || (() => {});
     this.handlers = opts.handlers || {};
-    this.token = crypto.randomBytes(32).toString('base64url');
+    // 调用方可以传入持久化的 token（见 extension.js 的 TOKEN_FILE）；不传就临时随机一个
+    this.token = opts.token || crypto.randomBytes(32).toString('base64url');
     this.server = null;
     this.wss = new WsServer();
     this.port = null;
