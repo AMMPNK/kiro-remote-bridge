@@ -289,4 +289,6 @@ class WsServer extends EventEmitter {
   }
 }
 
-module.exports = { WsServer, WsConnection };
+// MAX_PAYLOAD 导出，让上层能把真实上限告诉手机端 —— 客户端此前是自己写死一个
+// 6MB 的预算，与这里的 8MB 只靠注释关联，改一处另一处会静默失配。
+module.exports = { WsServer, WsConnection, MAX_PAYLOAD };

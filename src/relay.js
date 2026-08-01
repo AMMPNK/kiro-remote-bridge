@@ -14,7 +14,7 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 const crypto = require('crypto');
-const { WsServer } = require('./wsServer');
+const { WsServer, MAX_PAYLOAD } = require('./wsServer');
 
 const MIME = {
   '.html': 'text/html; charset=utf-8',
@@ -303,6 +303,11 @@ class Relay {
   /** 当前连接集合，供上层做按连接的状态归集 */
   get connections() {
     return this.wss.connections;
+  }
+
+  /** 单帧字节上限。握手时告诉手机端，让它按真实值算附件预算，而不是自己写死一份 */
+  get maxPayload() {
+    return MAX_PAYLOAD;
   }
 
   get clientCount() {

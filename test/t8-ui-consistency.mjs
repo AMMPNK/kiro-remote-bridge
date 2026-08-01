@@ -102,7 +102,6 @@ const handled = new Set([...script.matchAll(/case '([a-zA-Z]+)':/g)].map((m) => 
 const relaySrc = readFileSync(join(ROOT, 'src', 'relay.js'), 'utf8');
 /** 前端刻意不进 switch 的类型，必须写明理由；新类型默认要求被处理（fail-closed） */
 const NOT_IN_SWITCH = new Map([
-  ['hello', '连接握手，随首屏推送一起到，前端不单独分支'],
   ['diagnostics', '自诊断应答，只在开发时查看，前端不请求'],
 ]);
 // 只认真正发往手机的出口：broadcast(…)、sendJson(…)、handler 的 return / 箭头直接返回。

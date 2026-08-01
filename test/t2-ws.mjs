@@ -106,5 +106,28 @@ check('收到服务端关闭码 4321',
 check('server 连接表已清空', wss.connections.size === 0, `size=${wss.connections.size}`);
 
 server.close();
+
+// 10. 帧上限只能有一个事实源
+// 手机端的附件预算按服务端在 hello 里报来的 maxPayload 算。它还留了一份兜底数字，
+// 供拿不到 hello 时使用 —— 这条闸门盯着那份兜底值不要和服务端脱节。
+const { MAX_PAYLOAD } = require('./src/wsServer.js');
+const { Relay } = require('./src/relay.js');
+check('wsServer 导出了 MAX_PAYLOAD', typeof MAX_PAYLOAD === 'number' && MAX_PAYLOAD > 0,
+  String(MAX_PAYLOAD));
+const probe = new Relay({ mediaDir: '.', log: () => {}, handlers: {} });
+check('relay.maxPayload 透传 wsServer 的值', probe.maxPayload === MAX_PAYLOAD,
+  `${probe.maxPayload} vs ${MAX_PAYLOAD}`);
+
+const appSrc = require('node:fs').readFileSync(join(ROOT, 'media', 'app.html'), 'utf8');
+const fbMatch = /MAX_PAYLOAD_FALLBACK = ([\d* ]+);/.exec(appSrc);
+const fallback = fbMatch
+  ? fbMatch[1].split('*').reduce((a, b) => a * Number(b.trim()), 1)
+  : NaN;
+check('前端兜底帧上限与服务端一致', fallback === MAX_PAYLOAD,
+  `前端 ${fallback} vs 服务端 ${MAX_PAYLOAD}`);
+check('前端按 hello 里的 maxPayload 重算预算',
+  /case 'hello':[\s\S]{0,300}?maxTotalB64 = Math\.floor\(Number\(m\.maxPayload\)/.test(appSrc));
+check('前端不再有写死的 MAX_TOTAL_B64 常量', !/const MAX_TOTAL_B64/.test(appSrc));
+
 console.log(`\n结果: ${pass} 通过 / ${fail} 失败`);
 process.exit(fail ? 1 : 0);

@@ -132,7 +132,12 @@ function buildHandlers() {
   return {
     /** 手机连上来就推一次全量，避免它自己发请求 */
     __onConnect: async (conn) => {
-      conn.sendJson({ type: 'hello', workspace: currentWorkspaceName() });
+      // maxPayload 必须带上：手机端的附件预算要按服务端的真实帧上限算
+      conn.sendJson({
+        type: 'hello',
+        workspace: currentWorkspaceName(),
+        maxPayload: relay ? relay.maxPayload : undefined,
+      });
       conn.sendJson({ type: 'sessions', items: store.listSessions() });
       conn.sendJson({ type: 'status', ...store.aggregateStatus(), mux: muxSummary() });
     },

@@ -1190,6 +1190,12 @@ function connect() {
     let m;
     try { m = JSON.parse(ev.data); } catch (_) { return; }
     switch (m.type) {
+      // 握手：附件预算按服务端报来的真实帧上限算，不用前端自己那份写死的数字
+      case 'hello':
+        if (Number(m.maxPayload) > 0) {
+          maxTotalB64 = Math.floor(Number(m.maxPayload) * FRAME_BUDGET_RATIO);
+        }
+        break;
       case 'sessions': {
         const next = m.items || [];
         // live 必须进签名。它是后端按时间窗算的，会在文件完全没动的情况下自己
@@ -1451,8 +1457,16 @@ const sendBtn = el('send');
 const IMG_MAX_EDGE = 1600;
 /** 单个非图片文件上限（base64 之前） */
 const MAX_ATT_BYTES = 5 * 1024 * 1024;
-/** 一条消息里 base64 总量上限。服务端帧上限 8MB，这里留出协议与 JSON 的余量 */
-const MAX_TOTAL_B64 = 6 * 1024 * 1024;
+/**
+ * 一条消息里 base64 总量上限，按服务端**实际**帧上限的 75% 算，留出 JSON 外壳的余量。
+ *
+ * 这个值原来是写死的 6MB，与 wsServer 的 8MB 只靠一句注释关联 —— 改一边另一边就静默
+ * 失配，表现是附件在服务端被拒但手机上看不出原因。现在服务端在 hello 里报真实值。
+ * 下面的兜底数字只在拿不到 hello 时使用，t2 有闸门盯着它和服务端保持一致。
+ */
+const FRAME_BUDGET_RATIO = 0.75;
+const MAX_PAYLOAD_FALLBACK = 8 * 1024 * 1024;
+let maxTotalB64 = Math.floor(MAX_PAYLOAD_FALLBACK * FRAME_BUDGET_RATIO);
 let atts = [];
 
 const fmtSize = (n) =>
@@ -1534,7 +1548,7 @@ async function addFiles(files) {
         ? await shrinkImage(f)
         : { mimeType: f.type || 'application/octet-stream', data: await readBase64(f) };
       const total = atts.reduce((s, a) => s + a.data.length, 0) + got.data.length;
-      if (total > MAX_TOTAL_B64) {
+      if (total > maxTotalB64) {
         toast('这条消息的附件总量超上限了，先发出去再加');
         continue;
       }
