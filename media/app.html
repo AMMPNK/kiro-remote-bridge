@@ -32,7 +32,9 @@
     transition:background .2s}
   .dot.running{background:var(--green);box-shadow:0 0 0 3px #3fb95022;animation:bp 1.5s infinite}
   .dot.waiting{background:var(--amber);box-shadow:0 0 0 3px #d2992222;animation:bp .9s infinite}
-  .dot.off{background:var(--red)}
+  /* 连着且空闲：绿色常亮。灰色只在页面刚打开、还没连上时出现 */
+  .dot.on{background:var(--green)}
+  .dot.off{background:var(--red);box-shadow:0 0 0 3px #f8514922}
   @keyframes bp{0%,100%{opacity:1}50%{opacity:.4}}
   .htitle{flex:1;min-width:0;font-size:16px;font-weight:600;letter-spacing:-.01em;
     overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
@@ -406,6 +408,21 @@ const WS_URL = (location.protocol === 'https:' ? 'wss://' : 'ws://') +
 const el = (id) => document.getElementById(id);
 const mainEl = el('main'), dotEl = el('dot'), titleEl = el('title'), subEl = el('sub');
 let ws = null, reconnectDelay = 800, reqSeq = 1, failStreak = 0;
+/**
+ * 顶栏那个点表示的是**连接状态**，agent 忙闲只是它的修饰。
+ *
+ * 之前是直接被 agent 状态覆写的，于是「连着但空闲」和「断了」都是灰色，
+ * 一眼看不出链路还在不在 —— 而连接状态恰恰是最该被一眼看见的那一项。
+ *   断开        -> 红
+ *   等待确认    -> 琥珀（有事要你处理）
+ *   正在跑      -> 绿色脉动
+ *   连着且空闲  -> 绿色常亮
+ */
+let connected = false;
+let agentBusy = '';
+function paintDot() {
+  dotEl.className = connected ? 'dot ' + (agentBusy || 'on') : 'dot off';
+}
 let sessions = [], view = 'list', openId = null, openTitle = '';
 let sessionsSig = '', searchQ = '';
 let lastStatus = { state: 'idle', running: 0, waiting: 0 };
@@ -522,7 +539,8 @@ function renderList(keepScroll) {
   if (runN) bits.push(`${runN} 运行中`);
   subEl.textContent = bits.join(' · ');
   subEl.classList.remove('hide');
-  dotEl.className = 'dot' + (waitN ? ' waiting' : runN ? ' running' : '');
+  agentBusy = waitN ? 'waiting' : runN ? 'running' : '';
+  paintDot();
 
   const emptyN = sessions.filter(isEmpty).length;
   const archN = sessions.filter((s) => archived.has(s.sessionId)).length;
@@ -1073,7 +1091,9 @@ el('pno').onclick = () => {
 
 // ---------------------------------------------------------------- 连接
 function showBlocker(text, hint) {
-  dotEl.className = 'dot off';
+  // 统一走同一个状态源，避免 connected 与点上显示的东西各说各话
+  connected = false;
+  paintDot();
   titleEl.textContent = text;
   subEl.classList.add('hide');
   el('composer').classList.add('hide');
@@ -1094,9 +1114,15 @@ function connect() {
     return;
   }
   ws = new WebSocket(WS_URL);
-  ws.onopen = () => { reconnectDelay = 800; failStreak = 0; dotEl.className = 'dot'; };
+  ws.onopen = () => {
+    reconnectDelay = 800;
+    failStreak = 0;
+    connected = true;
+    paintDot();
+  };
   ws.onclose = async () => {
-    dotEl.className = 'dot off';
+    connected = false;
+    paintDot();
     failStreak++;
     // 连续失败 3 次才探认证：切 App / 锁屏导致的正常断开不该被当成故障
     if (failStreak >= 3 && (await probeAuth()) === 401) {
@@ -1286,7 +1312,8 @@ function renderArchived() {
   el('searchWrap').classList.add('hide');
   el('composer').classList.add('hide');
   el('pend').classList.add('hide');
-  dotEl.className = 'dot';
+  agentBusy = '';
+  paintDot();
 
   const items = sessions
     .filter((s) => archived.has(s.sessionId))
