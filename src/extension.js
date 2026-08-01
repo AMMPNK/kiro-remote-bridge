@@ -82,6 +82,8 @@ let modelOptions = [];
 let modelCurrent;
 /** caffeinate 子进程，阻止空闲休眠；中继停止时释放 */
 let awake;
+/** 当前已订阅的 {sessionId, port}。port 变了说明 mux 重连过，订阅已失效 */
+let subscribedTo = { sessionId: null, port: null };
 /** activate 时存下来，轮换 token 后要用它重启中继 */
 let extContext;
 
@@ -205,11 +207,32 @@ function subscribeSession(sessionId) {
     log(`[subscribe] 没有可用的 mux 连接，${sessionId} 只能靠文件轮询`);
     return;
   }
+  const port = conn.endpoint.port;
   conn.request('_kiro/session/history', { sessionId, limit: 1 }).then(
-    () => log(`[subscribe] 已订阅 ${sessionId}（port=${conn.endpoint.port}）`),
-    (err) =>
-      log(`[subscribe] 订阅 ${sessionId} 失败，实时事件收不到: ${err && err.message}`)
+    () => {
+      subscribedTo = { sessionId, port };
+      log(`[subscribe] 已订阅 ${sessionId}（port=${port}）`);
+    },
+    (err) => {
+      subscribedTo = { sessionId: null, port: null };
+      log(`[subscribe] 订阅 ${sessionId} 失败，实时事件收不到: ${err && err.message}`);
+    }
   );
+}
+
+/**
+ * 订阅是**连接级**的：mux 断开重连、或扩展重启后，之前的订阅就没了，而手机端不一定会
+ * 重新发 session:open。表现是「本来能收到审批，过一会儿又收不到了」，且没有任何报错。
+ * 所以定期核对一次：会话变了、或者连接换了端口（意味着重连过），就重新订阅。
+ */
+function ensureSubscribed() {
+  if (!watchedSessionId) return;
+  const conn = muxPool.pickForWorkspace(workspaceOfSession(watchedSessionId));
+  if (!conn) return;
+  if (subscribedTo.sessionId === watchedSessionId && subscribedTo.port === conn.endpoint.port) {
+    return;
+  }
+  subscribeSession(watchedSessionId);
 }
 
 /** 从历史会话里聚合出用过的模型，按出现次数排序。这是确定可用的兜底来源。 */
@@ -433,7 +456,31 @@ async function createSession(workspacePath, picks) {
       log(`[create] 设置${LABEL[configId]}失败（会话已创建，用默认值）: ${msg}`);
     }
   }
+  // 让桌面端 attach 到这个会话，否则它的审批请求会被立刻取消。
+  // 依据：ACP SDK 的 requestPermission 是「按 sessionId 找 handler，找不到就直接返回
+  // cancelled」（源码注释原文 defaults to cancelled if no handler），而 handler 由
+  // 拥有该会话的桌面面板通过 onPermissionRequest(sessionId, …) 注册。纯靠 mux 创建的
+  // 会话没有面板拥有它 → 无 handler → 实测 6~20ms 内就被判 cancelled，手机上批不动。
+  // Kiro 自己的程序化建会话流程也是先 viewSession 再发 prompt，这里沿用同一做法。
+  await attachDesktop(sessionId);
+
   return { sessionId, cwd, applied, failed };
+}
+
+/**
+ * 把会话在桌面侧打开，使其注册权限 handler。
+ *
+ * 副作用是桌面侧边栏会切到这个会话 —— 这是必要代价：不 attach 就等于这个会话的所有
+ * 审批都会被静默取消。只在「手机新建会话」时调用，不在打开已有会话时调用：
+ * 那会把你在电脑上正在用的会话挤掉，反而弄坏本来正常的审批。
+ */
+async function attachDesktop(sessionId) {
+  try {
+    await vscode.commands.executeCommand('kiroAgent.viewSession', sessionId);
+    log(`[attach] 桌面已打开 ${sessionId}，审批 handler 应已注册`);
+  } catch (err) {
+    log(`[attach] 打开失败，该会话的审批可能会被直接取消: ${err && err.message}`);
+  }
 }
 
 function currentWorkspaceName() {
@@ -592,6 +639,8 @@ function startPolling() {
 
   listTimer = setInterval(() => {
     if (!relay || relay.clientCount === 0) return;
+    // 订阅是连接级的，重连后会静默失效，所以每轮核对一次（命中时不发请求）
+    ensureSubscribed();
     try {
       // 只扫一次目录，状态聚合复用同一份结果
       const items = store.listSessions();

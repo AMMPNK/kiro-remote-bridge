@@ -644,10 +644,35 @@ function settleThinking(scope, keepLastLive) {
 function applyMuxUpdate(params) {
   if (!params || params.sessionId !== openId) return;
   const u = params.update;
-  if (!u || u.sessionUpdate !== 'agent_thought_chunk') return;
+  if (!u) return;
   const c = u.content;
   const text = c && c.type === 'text' ? c.text : '';
-  if (text) streamThought(text);
+  if (!text) return;
+  if (u.sessionUpdate === 'agent_thought_chunk') streamThought(text);
+  else if (u.sessionUpdate === 'agent_message_chunk') streamSay(text);
+}
+
+/**
+ * 正文增量。与思考同构，只是渲染成助手气泡。
+ *
+ * 注意必须把原始文本累积在 data-raw 里、每次整体重渲染：markdown 标记会被切在两个
+ * 增量之间（`**粗` + `体**`），逐块追加 HTML 会渲染错。
+ */
+function streamSay(text) {
+  const atBottom = mainEl.scrollHeight - mainEl.scrollTop - mainEl.clientHeight < 140;
+  let block = mainEl.lastElementChild;
+  const live = block && block.classList.contains('arow') && block.dataset.stream;
+  if (!live) {
+    const holder = document.createElement('div');
+    holder.innerHTML = nodeFor({ kind: 'message', role: 'assistant', text: '' });
+    block = holder.firstElementChild;
+    block.dataset.stream = '1';
+    mainEl.appendChild(block);
+  }
+  const body = block.querySelector('.a');
+  body.dataset.raw = (body.dataset.raw || '') + text;
+  body.innerHTML = mdInline(body.dataset.raw);
+  if (atBottom) scrollBottom();
 }
 
 /** 把一块思考增量追加到「正在思考」的占位块上，没有就新建一个 */
@@ -675,7 +700,7 @@ function streamThought(text) {
  * 这段体验，权威版本一到就把它撤掉，避免同一段思考出现两遍。
  */
 function dropStreamPlaceholders() {
-  for (const b of mainEl.querySelectorAll('.think[data-stream]')) b.remove();
+  for (const b of mainEl.querySelectorAll('[data-stream]')) b.remove();
 }
 
 function nodeFor(m) {
@@ -748,8 +773,18 @@ function renderHistory(msgs, truncated) {
 
 function appendDelta(msgs) {
   reconcilePending(msgs);
-  // tail 带来了权威思考，或回合已结束 → 撤掉实时占位，避免同一段思考出现两遍
-  if (msgs.some((m) => m.kind === 'reasoning' || m.kind === 'turnEnd')) dropStreamPlaceholders();
+  // tail 带来了权威内容（思考或正文），或回合已结束 → 撤掉实时占位，避免同一段出现两遍。
+  // 必须在下面的合并循环之前做：否则权威的 .arow 会被并进占位块而不是替换它。
+  if (
+    msgs.some(
+      (m) =>
+        m.kind === 'reasoning' ||
+        m.kind === 'turnEnd' ||
+        (m.kind === 'message' && m.role === 'assistant')
+    )
+  ) {
+    dropStreamPlaceholders();
+  }
   const atBottom = mainEl.scrollHeight - mainEl.scrollTop - mainEl.clientHeight < 140;
   const frag = document.createElement('div');
   frag.innerHTML = msgs.map(nodeFor).join('');
