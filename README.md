@@ -102,10 +102,23 @@ cd test/ref && npm i
 
 ## 致谢
 
-<!-- 待确认：借鉴思路的原项目仓库地址。确认后替换下面这行。 -->
-思路上参考了社区里同类的远程控制尝试（原项目：_待补链接_），实现是独立编写的：本项目直连 agent mux server（ACP over WebSocket），并叠加了双数据源分层降级、流式思维链与 UI 一致性门禁。
+灵感来自 [hopansh/kiro-remote](https://github.com/hopansh/kiro-remote)（MIT）—— 它先做出了「用手机控制本机 Kiro」这件事，本项目的产品形态（扫码接入、手机端浏览会话、远程审批）受它启发。
 
-同类项目：[Homas/kiro-telegram-integration](https://github.com/Homas/kiro-telegram-integration) 走 IM 转发通知与审批，思路不同但目标相近。
+**代码是独立编写的**，几乎每一层的机制都不一样：
+
+| | hopansh/kiro-remote | 本项目 |
+| --- | --- | --- |
+| 语言 | TypeScript | JavaScript，零运行时依赖 |
+| 中继 | 独立的 relay-server 进程（含 npm 依赖） | 扩展进程内，手写 WebSocket 服务端 |
+| 取会话数据 | 监听磁盘执行文件（chatWatcher / executionWatcher） | 直连 agent mux server，ACP over WebSocket |
+| 工具审批 | 往 `.kiro/hooks/` 安装 hook 脚本 | 响应 ACP `session/request_permission` |
+| 流式 | 正文实时流 | 思考走 `agent_thought_chunk` 实时流；正文约 1 秒一批 |
+| 远程访问 | Cloudflare Tunnel + 推送通知 + PWA 离线 | 仅局域网 |
+| 二维码 | 依赖库 | 手写编码器，测试中与 `qrcode` 逐版本对照 |
+
+平心而论，对方在 Cloudflare Tunnel、推送通知、PWA 离线支持上更完整，**工具审批也确实是能用的**（走 hook 拦截点，绕开了本项目遇到的 ACP 权限请求被自动取消的问题）。本项目的侧重是直接说 ACP 协议、零依赖、以及把降级路径显式化。
+
+同类项目还有 [Homas/kiro-telegram-integration](https://github.com/Homas/kiro-telegram-integration)，走 IM 转发通知与审批，目标相近而路子不同。
 
 ## License
 
