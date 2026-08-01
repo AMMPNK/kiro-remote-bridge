@@ -1,4 +1,11 @@
-// 验证 sessionStore 对真实会话数据的解析（只读）。
+// 用**真实**会话数据校验 sessionStore 的解析（只读，不写任何文件）。
+//
+// 这个文件的作用与 t7/t9 不同，不可互相替代：那两个跑合成 fixture，验的是解析逻辑；
+// 这里验的是「解析逻辑仍然匹配 Kiro 实际写出来的格式」—— 格式漂移只有真实数据能发现。
+//
+// 此前它是一个纯 console.log 的观察脚本：零断言，永远不会失败，而 run-all 汇总里显示
+// 「[ OK ] 0 通过 / 0 失败」，和真正通过长得一模一样。另外 list[0] 没有守卫，在一台
+// 没有会话的机器上会抛 TypeError 变成 FAIL —— 该跳过的情况被报成了故障。
 import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
@@ -6,60 +13,126 @@ const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
 const require = createRequire(join(ROOT, 'package.json'));
 const { SessionStore } = require('./src/sessionStore.js');
 
-const store = new SessionStore((m) => {});
-console.log('sessions root exists:', store.exists());
+let pass = 0, fail = 0;
+const check = (n, ok, extra = '') => {
+  console.log(`  ${ok ? 'PASS' : 'FAIL'}  ${n}${extra ? '  ' + extra : ''}`);
+  ok ? pass++ : fail++;
+};
+
+const store = new SessionStore(() => {});
+
+/** 本机没有可用的真实数据时应当跳过，而不是当成故障 */
+const shouldSkip = (s) => !s.exists() || s.listSessionDirs().length === 0;
+
+// ---------------------------------------------------------------- 没有真实数据就明确跳过
+// 关键是「跳过」必须和「通过」在输出上可区分，否则一台没有会话的机器会报绿，
+// 而它其实一条都没验。
+if (shouldSkip(store)) {
+  console.log('SKIP  本机没有 ~/.kiro/sessions 数据，真实数据校验跳过');
+  console.log('结果: 0 通过 / 0 失败（SKIP）');
+  process.exit(0);
+}
 
 const dirs = store.listSessionDirs();
-console.log('会话目录数:', dirs.length);
-
 const list = store.listSessions();
-console.log('解析出的会话数:', list.length);
-const wsSet = new Set(list.map((s) => (s.workspacePaths || [])[0] || '(none)'));
-console.log('涉及 workspace 数:', wsSet.size);
+console.log(`（真实数据：${dirs.length} 个目录，解析出 ${list.length} 个会话）`);
 
-const statusCount = {};
-for (const s of list) statusCount[s.status] = (statusCount[s.status] || 0) + 1;
-console.log('status 分布:', statusCount);
+// ---------------------------------------------------------------- 列表层
+check('解析出的会话数不超过目录数', list.length <= dirs.length,
+  `${list.length} <= ${dirs.length}`);
+check('至少解析出一个会话', list.length > 0, `${list.length} 个`);
 
-console.log('\n最近 5 个会话（应按活动时间倒序）:');
-for (const s of list.slice(0, 5)) {
-  console.log(
-    `  ${new Date(s.lastActiveAt).toISOString().slice(0, 16)}  [${s.status}] ` +
-      `${s.workspaceName} :: ${s.title.slice(0, 46).replace(/\n/g, ' ')}`
-  );
-}
-// 倒序自检
+check('每个会话都有 sessionId', list.every((s) => !!s.sessionId));
+check('每个会话都有标题', list.every((s) => typeof s.title === 'string' && s.title.length > 0),
+  `缺失 ${list.filter((s) => !s.title).length} 个`);
+check('lastActiveAt 都是有限数值',
+  list.every((s) => Number.isFinite(s.lastActiveAt)),
+  `异常 ${list.filter((s) => !Number.isFinite(s.lastActiveAt)).length} 个`);
+check('sessionId 无重复', new Set(list.map((s) => s.sessionId)).size === list.length);
+
+// 按活动时间倒序 —— 手机端列表的排序依赖它
 let ordered = true;
 for (let i = 1; i < list.length; i++) {
   if (list[i - 1].lastActiveAt < list[i].lastActiveAt) ordered = false;
 }
-console.log('倒序正确:', ordered);
+check('按 lastActiveAt 倒序', ordered);
 
-// 读最新会话的历史
-const target = list[0];
-console.log(`\n读取历史: ${target.sessionId}`);
+// status / live 只能落在已知取值里。冒出新值说明 Kiro 换了格式，必须知道
+const KNOWN_STATUS = new Set(['in_progress', 'waiting_on_user', 'completed', 'idle', 'unknown']);
+const KNOWN_LIVE = new Set(['running', 'waiting', 'idle']);
+const badStatus = [...new Set(list.map((s) => s.status))].filter((v) => !KNOWN_STATUS.has(v));
+check('status 都在已知取值内', badStatus.length === 0,
+  badStatus.length ? `未知: ${badStatus.join(',')}` : [...new Set(list.map((s) => s.status))].join(','));
+const badLive = [...new Set(list.map((s) => s.live))].filter((v) => !KNOWN_LIVE.has(v));
+check('live 都在已知取值内', badLive.length === 0,
+  badLive.length ? `未知: ${badLive.join(',')}` : [...new Set(list.map((s) => s.live))].join(','));
+
+// ---------------------------------------------------------------- 历史层
+const target = list.find((s) => s.bytes > 0) || list[0];
 const t0 = Date.now();
 const h = store.readHistory(target.sessionId, 400);
-console.log(`  耗时 ${Date.now() - t0}ms  found=${h.found} truncated=${h.truncated}`);
-console.log(`  渲染消息数: ${h.messages.length}`);
-const kinds = {};
-for (const m of h.messages) kinds[m.kind] = (kinds[m.kind] || 0) + 1;
-console.log('  kind 分布:', kinds);
+const readMs = Date.now() - t0;
+check('最新会话的历史能读出来', h.found === true, `found=${h.found}`);
+check('消息数不超过 limit', h.messages.length <= 400, `${h.messages.length} 条`);
+check('截断标记与消息数自洽',
+  h.truncated ? h.messages.length === 400 : h.messages.length <= 400,
+  `truncated=${h.truncated} n=${h.messages.length}`);
 
-const firstUser = h.messages.find((m) => m.kind === 'message' && m.role === 'user');
-console.log('  首条用户消息:', firstUser ? JSON.stringify(firstUser.text.slice(0, 70)) : '(无)');
-const firstAsst = h.messages.find((m) => m.kind === 'message' && m.role === 'assistant');
-console.log('  首条助手消息长度:', firstAsst ? firstAsst.text.length : 0);
-const tool = h.messages.find((m) => m.kind === 'tool');
-console.log('  首个工具卡片:', tool ? `${tool.toolName} status=${tool.status}` : '(无)');
+const KNOWN_KINDS = new Set(['message', 'tool', 'toolResult', 'context', 'reasoning',
+  'pending', 'resolved', 'turnEnd', 'error', 'tombstone', 'subAgent']);
+const badKinds = [...new Set(h.messages.map((m) => m.kind))].filter((k) => !KNOWN_KINDS.has(k));
+check('渲染事件的 kind 都在已知取值内', badKinds.length === 0,
+  badKinds.length ? `未知: ${badKinds.join(',')}` : `${new Set(h.messages.map((m) => m.kind)).size} 种`);
+check('每条消息都带 kind', h.messages.every((m) => !!m.kind));
 
-// 增量 tail：应为空（刚读过），随后再验证游标行为
+const msgs = h.messages.filter((m) => m.kind === 'message');
+check('message 事件的 role 只有 user / assistant',
+  msgs.every((m) => m.role === 'user' || m.role === 'assistant'),
+  [...new Set(msgs.map((m) => m.role))].join(','));
+check('message 事件都有文本字段', msgs.every((m) => typeof m.text === 'string'));
+
+// ---------------------------------------------------------------- 游标层
+// 刚整读过，紧接着 tail 必须是空的。这条是手机端不会看到重复内容的依据。
 const d1 = store.tail(target.sessionId);
-console.log(`\n首次 tail（应为 0 条）: ${d1.messages.length} 条, reset=${!!d1.reset}`);
+check('readHistory 之后紧接 tail 为空',
+  d1.messages.length === 0 && !d1.reset,
+  `${d1.messages.length} 条 reset=${!!d1.reset}`);
 
-// 聚合状态
-console.log('聚合状态:', store.aggregateStatus());
-
-// 不存在的会话
+// ---------------------------------------------------------------- 边界
 const miss = store.readHistory('sess_does-not-exist');
-console.log('不存在会话:', JSON.stringify(miss));
+check('不存在的会话返回 found=false 且不抛错',
+  miss.found === false && Array.isArray(miss.messages) && miss.messages.length === 0,
+  JSON.stringify(miss));
+const missTail = store.tail('sess_does-not-exist');
+check('对不存在的会话 tail 不抛错',
+  Array.isArray(missTail.messages) && missTail.messages.length === 0);
+
+const agg = store.aggregateStatus();
+check('聚合状态的计数是非负整数',
+  Number.isInteger(agg.running) && agg.running >= 0 &&
+  Number.isInteger(agg.waiting) && agg.waiting >= 0,
+  JSON.stringify(agg));
+check('聚合计数不超过会话总数', agg.running + agg.waiting <= list.length,
+  `${agg.running}+${agg.waiting} <= ${list.length}`);
+check('聚合状态与 live 分布一致',
+  agg.running === list.filter((s) => s.live === 'running').length &&
+  agg.waiting === list.filter((s) => s.live === 'waiting').length,
+  `agg=${agg.running}/${agg.waiting} live=${list.filter((s) => s.live === 'running').length}/${list.filter((s) => s.live === 'waiting').length}`);
+
+// ---------------------------------------------------------------- 跳过判定本身也要验
+// 否则「没有数据时会跳过」这条路径永远不会被执行到，而它恰恰是别人机器上会走的那条。
+class EmptyStore extends SessionStore {
+  exists() { return false; }
+  listSessionDirs() { return []; }
+}
+class NoDirStore extends SessionStore {
+  exists() { return true; }
+  listSessionDirs() { return []; }
+}
+check('根目录不存在时判定为跳过', shouldSkip(new EmptyStore(() => {})) === true);
+check('根目录存在但没有会话时也判定为跳过', shouldSkip(new NoDirStore(() => {})) === true);
+check('本机有真实数据时不跳过', shouldSkip(store) === false);
+
+console.log(`（最大会话读取耗时 ${readMs}ms，${h.messages.length} 条渲染消息）`);
+console.log(`\n结果: ${pass} 通过 / ${fail} 失败`);
+process.exit(fail ? 1 : 0);
