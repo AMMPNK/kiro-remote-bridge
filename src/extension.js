@@ -128,9 +128,11 @@ function buildHandlers() {
     'session:send': async (msg) => {
       const sessionId = String(msg.sessionId || '');
       const text = String(msg.text || '').trim();
-      if (!sessionId || !text) throw new Error('sessionId 与 text 都不能为空');
-      const r = await sendToSession(sessionId, text);
-      return { type: 'sent', sessionId, via: r.via };
+      const attachments = Array.isArray(msg.attachments) ? msg.attachments : [];
+      if (!sessionId) throw new Error('sessionId 不能为空');
+      if (!text && !attachments.length) throw new Error('内容不能为空');
+      const r = await sendToSession(sessionId, text, attachments);
+      return { type: 'sent', sessionId, via: r.via, attachments: attachments.length };
     },
 
     /** approve=true 放行，false 拒绝。有细粒度通道就用，否则退回全量命令。 */
@@ -512,9 +514,51 @@ function workspaceOfSession(sessionId) {
  * 所以只看这段窗口里有没有回错误（例如 A prompt is already in-flight、Session not found），
  * 没有就当已送达，回合继续在后台跑。返回 null 表示没观察到错误。
  */
-async function tryPrompt(conn, sessionId, text) {
+/** 文本类 mime：这些用 resource.text 送，agent 侧能直接当文本读 */
+const TEXTISH = /^text\/|json|xml|csv|yaml|javascript|typescript|markdown|x-sh|x-python/i;
+
+/**
+ * 把手机传来的附件转成 ACP 内容块。
+ *
+ * 形状取自 Kiro 产物里的 zContentBlock（都已核实）：
+ *   图片       -> { type:'image', data:<base64>, mimeType }
+ *   文本类文件 -> { type:'resource', resource:{ uri, mimeType, text } }
+ *   其他二进制 -> { type:'resource', resource:{ uri, mimeType, blob:<base64> } }
+ * 手机端统一传 base64，文本类在这里解码，省得前端判断编码。
+ */
+function blocksFor(text, attachments) {
+  const blocks = [];
+  if (text) blocks.push({ type: 'text', text });
+  for (const a of attachments || []) {
+    const data = String((a && a.data) || '');
+    if (!data) continue;
+    const name = String((a && a.name) || 'file');
+    const mimeType = String((a && a.mimeType) || 'application/octet-stream');
+    if (mimeType.startsWith('image/')) {
+      blocks.push({ type: 'image', data, mimeType });
+      continue;
+    }
+    const uri = `attachment://${encodeURIComponent(name)}`;
+    if (TEXTISH.test(mimeType)) {
+      let decoded = '';
+      try {
+        decoded = Buffer.from(data, 'base64').toString('utf8');
+      } catch (err) {
+        log(`[send] 附件 ${name} 解码失败，改按二进制发送: ${err && err.message}`);
+      }
+      if (decoded) {
+        blocks.push({ type: 'resource', resource: { uri, mimeType, text: decoded } });
+        continue;
+      }
+    }
+    blocks.push({ type: 'resource', resource: { uri, mimeType, blob: data } });
+  }
+  return blocks;
+}
+
+async function tryPrompt(conn, sessionId, prompt) {
   let failure = null;
-  const inflight = conn.sendPrompt(sessionId, text);
+  const inflight = conn.sendPrompt(sessionId, prompt);
   inflight.then(
     () => log(`[send] 回合结束 session=${sessionId}`),
     (err) => {
@@ -536,11 +580,17 @@ function isSessionUnknown(err) {
   return /not found|unknown session|no such session/i.test(String((err && err.message) || err));
 }
 
-async function sendToSession(sessionId, text) {
+async function sendToSession(sessionId, text, attachments) {
+  const atts = Array.isArray(attachments) ? attachments : [];
+  const prompt = blocksFor(text, atts);
   const wsPath = workspaceOfSession(sessionId);
   const conn = muxPool.pickForWorkspace(wsPath);
   if (conn) {
-    let failure = await tryPrompt(conn, sessionId, text);
+    if (atts.length) {
+      const kinds = prompt.map((b) => b.type).join(',');
+      log(`[send] 带 ${atts.length} 个附件 session=${sessionId} 块=${kinds}`);
+    }
+    let failure = await tryPrompt(conn, sessionId, prompt);
     // agent 不认识这个会话 → 让桌面加载一次再重试。
     // 不用 ACP 的 session/load：它要求传 mcpServers，传空数组有可能让该会话丢掉 MCP 工具，
     // 属于会静默降级的副作用；走桌面加载则用它自己的配置。
@@ -549,13 +599,18 @@ async function sendToSession(sessionId, text) {
       await attachDesktop(sessionId);
       // viewSession 只是把面板切过去，加载是异步的；不留一点时间的话重试仍会 not found
       await new Promise((r) => setTimeout(r, ATTACH_SETTLE_MS));
-      failure = await tryPrompt(conn, sessionId, text);
+      failure = await tryPrompt(conn, sessionId, prompt);
     }
     if (!failure) {
       log(`[send] via mux port=${conn.endpoint.port} session=${sessionId}`);
       return { via: 'mux' };
     }
     log(`[send] mux 失败，降级命令: ${failure.message}`);
+  }
+  // 降级通道只能传纯文本。带附件时如实报错 —— 悄悄把附件丢掉再显示「已发送」，
+  // 是最坏的一种失败：用户以为图发出去了，而 agent 从没见过它。
+  if (atts.length) {
+    throw new Error(`mux 通道不可用，带附件的消息发不出去（降级通道只支持纯文本）`);
   }
   // 降级：kiroAgent.sessions.sendPrompt(sessionId, text) 在扩展产物中确认 sessionId 有效
   try {

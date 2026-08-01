@@ -96,8 +96,17 @@ const NOT_IN_SWITCH = new Map([
   ['diagnostics', '自诊断应答，只在开发时查看，前端不请求'],
   ['cancelled', 'session:cancel 的应答，而前端从不发这个请求'],
 ]);
+// 只认真正发往手机的出口：broadcast(…)、sendJson(…)、handler 的 return / 箭头直接返回。
+// 不能宽泛地抓所有 type: 'x' —— 后端还会构造 ACP 内容块（image / resource / text），
+// 那些不是广播类型，抓进来会让这条门禁误报，进而诱使人给前端加没用的 handler。
 const broadcast = [
-  ...new Set([...(extHandlers + relaySrc).matchAll(/type:\s*'([a-zA-Z][\w]*)'/g)].map((m) => m[1])),
+  ...new Set(
+    [
+      ...(extHandlers + relaySrc).matchAll(
+        /(?:broadcast|sendJson|return|=>)\s*\(?\s*\{\s*type:\s*'([a-zA-Z][\w]*)'/g
+      ),
+    ].map((m) => m[1])
+  ),
 ].filter((t) => !NOT_IN_SWITCH.has(t));
 const unhandled = broadcast.filter((t) => !handled.has(t));
 check('后端广播的类型前端都处理了', unhandled.length === 0,

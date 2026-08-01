@@ -188,15 +188,12 @@ class MuxConnection extends EventEmitter {
    * 返回的 Promise 要到**整个回合结束**才 settle，不是「已送达」。调用方想判断送达，
    * 应该只看短时间内有没有回错误，不要 await 它跑完（见 extension.js 的 sendToSession）。
    */
-  sendPrompt(sessionId, text, timeoutMs = PROMPT_TIMEOUT_MS) {
-    return this.request(
-      'session/prompt',
-      {
-        sessionId,
-        prompt: [{ type: 'text', text: String(text) }],
-      },
-      timeoutMs
-    );
+  sendPrompt(sessionId, promptOrText, timeoutMs = PROMPT_TIMEOUT_MS) {
+    // 传数组就当成已经组好的 ContentBlock[]（带附件时用），传字符串按纯文本处理
+    const prompt = Array.isArray(promptOrText)
+      ? promptOrText
+      : [{ type: 'text', text: String(promptOrText) }];
+    return this.request('session/prompt', { sessionId, prompt }, timeoutMs);
   }
 
   cancel(sessionId) {

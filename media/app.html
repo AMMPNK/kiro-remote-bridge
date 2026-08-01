@@ -120,6 +120,20 @@
     color:var(--fg)}
   .u .b strong{color:#fff;font-weight:600}
   .u .b code{background:#00000038;border-color:#ffffff26}
+
+  /* ---------- 待发送的附件 ---------- */
+  .atts{display:flex;flex-wrap:wrap;gap:6px;padding:0 0 8px}
+  .att{display:flex;align-items:center;gap:6px;min-width:0;background:var(--card2);
+    border:1px solid var(--line2);border-radius:8px;padding:5px 8px;font-size:11.5px;
+    color:var(--fg2)}
+  .att img{width:26px;height:26px;object-fit:cover;border-radius:4px;flex:0 0 auto}
+  .att .fn{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:44vw}
+  .att .sz{color:var(--faint);flex:0 0 auto}
+  .att .x{flex:0 0 auto;color:var(--faint);padding:0 2px;font-size:14px}
+  .attbtn{flex:0 0 auto;width:34px;height:34px;border-radius:50%;font:inherit;font-size:17px;
+    background:var(--card2);border:1px solid var(--line2);color:var(--fg2)}
+  .attbtn:active{background:#333a42}
+  .attbtn:disabled{opacity:.45}
   .tool{margin:0 0 8px;background:var(--card);border:1px solid var(--line);
     border-radius:9px;overflow:hidden}
   .tool .hd{display:flex;align-items:center;gap:7px;padding:8px 11px;font-size:12.5px}
@@ -270,10 +284,13 @@
   <main id="main"></main>
 
   <footer id="composer" class="hide">
+    <div class="atts hide" id="atts"></div>
     <div class="cmp">
+      <button class="attbtn" id="attach" aria-label="添加文件">＋</button>
       <textarea id="input" rows="1" placeholder="发消息…"></textarea>
       <button class="sendbtn" id="send" disabled aria-label="发送">↑</button>
     </div>
+    <input type="file" id="file" class="hide" multiple>
   </footer>
 </div>
 <div id="sheet" class="hide">
@@ -703,11 +720,17 @@ function dropStreamPlaceholders() {
   for (const b of mainEl.querySelectorAll('[data-stream]')) b.remove();
 }
 
+/** 用户消息的附件提示：只看文字分不出图到底有没有传上去 */
+function attNote(m) {
+  const n = (m.images || 0) + (m.documents || 0);
+  return n ? `<div class="sz">已附 ${n} 个文件</div>` : '';
+}
+
 function nodeFor(m) {
   switch (m.kind) {
     case 'message':
       return m.role === 'user'
-        ? `<div class="u"><div class="b">${mdInline(m.text)}</div></div>`
+        ? `<div class="u"><div class="b">${mdInline(m.text)}${attNote(m)}</div></div>`
         : `<div class="arow"><span class="ava"><svg><use href="#kiro"/></svg></span>` +
           `<div class="a">${mdInline(m.text)}</div></div>`;
     case 'tool': {
@@ -929,7 +952,10 @@ function connect() {
         showPending(m);
         break;
       case 'sent':
-        toast(m.via === 'mux' ? '已发送' : '已发送（命令通道）');
+        toast(
+          (m.attachments ? `已发送（含 ${m.attachments} 个附件）` : '已发送') +
+            (m.via === 'mux' ? '' : '（命令通道）')
+        );
         break;
       // 「已发出」不等于「已被接受」—— 真实结局由 resolved 增量给出，见 reconcilePending
       case 'approved':
@@ -1139,18 +1165,138 @@ el('search').addEventListener('input', (e) => {
 
 const input = el('input');
 const sendBtn = el('send');
+
+// ---------------------------------------------------------------- 附件
+/** 图片最长边。视觉模型不需要原图，而手机原图动辄 8-12MB，base64 后会顶爆帧上限 */
+const IMG_MAX_EDGE = 1600;
+/** 单个非图片文件上限（base64 之前） */
+const MAX_ATT_BYTES = 5 * 1024 * 1024;
+/** 一条消息里 base64 总量上限。服务端帧上限 8MB，这里留出协议与 JSON 的余量 */
+const MAX_TOTAL_B64 = 6 * 1024 * 1024;
+let atts = [];
+
+const fmtSize = (n) =>
+  n >= 1024 * 1024 ? (n / 1024 / 1024).toFixed(1) + 'MB' : Math.max(1, Math.round(n / 1024)) + 'KB';
+
+/**
+ * 图片在手机侧先缩边再编码。
+ * 不缩的话一张照片就能超过服务端 8MB 的帧上限，而且传上去也没有额外收益。
+ */
+function shrinkImage(file) {
+  return new Promise((resolve, reject) => {
+    const url = URL.createObjectURL(file);
+    const img = new Image();
+    img.onload = () => {
+      URL.revokeObjectURL(url);
+      const scale = Math.min(1, IMG_MAX_EDGE / Math.max(img.width, img.height));
+      const c = document.createElement('canvas');
+      c.width = Math.max(1, Math.round(img.width * scale));
+      c.height = Math.max(1, Math.round(img.height * scale));
+      c.getContext('2d').drawImage(img, 0, 0, c.width, c.height);
+      const durl = c.toDataURL('image/jpeg', 0.85);
+      resolve({ mimeType: 'image/jpeg', data: durl.slice(durl.indexOf(',') + 1) });
+    };
+    img.onerror = () => {
+      URL.revokeObjectURL(url);
+      reject(new Error('图片解不开'));
+    };
+    img.src = url;
+  });
+}
+
+function readBase64(file) {
+  return new Promise((resolve, reject) => {
+    const r = new FileReader();
+    r.onload = () => {
+      const s = String(r.result || '');
+      resolve(s.slice(s.indexOf(',') + 1));
+    };
+    r.onerror = () => reject(new Error('读不出来'));
+    r.readAsDataURL(file);
+  });
+}
+
+function renderAtts() {
+  const box = el('atts');
+  box.classList.toggle('hide', atts.length === 0);
+  box.innerHTML = atts
+    .map(
+      (a, i) =>
+        `<span class="att">${a.thumb ? `<img src="${esc(a.thumb)}" alt="">` : ''}` +
+        `<span class="fn">${esc(a.name)}</span>` +
+        `<span class="sz">${esc(a.sizeText)}</span>` +
+        `<span class="x" data-i="${i}">✕</span></span>`
+    )
+    .join('');
+  box.querySelectorAll('.x').forEach((x) => {
+    x.onclick = () => {
+      atts.splice(Number(x.dataset.i), 1);
+      renderAtts();
+      syncSendState();
+    };
+  });
+}
+
+function syncSendState() {
+  sendBtn.disabled = !input.value.trim() && atts.length === 0;
+}
+
+async function addFiles(files) {
+  for (const f of files) {
+    try {
+      const isImg = (f.type || '').startsWith('image/');
+      if (!isImg && f.size > MAX_ATT_BYTES) {
+        toast(`${f.name} 超过 ${fmtSize(MAX_ATT_BYTES)}，没加上`);
+        continue;
+      }
+      const got = isImg
+        ? await shrinkImage(f)
+        : { mimeType: f.type || 'application/octet-stream', data: await readBase64(f) };
+      const total = atts.reduce((s, a) => s + a.data.length, 0) + got.data.length;
+      if (total > MAX_TOTAL_B64) {
+        toast('这条消息的附件总量超上限了，先发出去再加');
+        continue;
+      }
+      atts.push({
+        name: f.name || 'file',
+        mimeType: got.mimeType,
+        data: got.data,
+        sizeText: fmtSize(Math.round((got.data.length * 3) / 4)),
+        thumb: isImg ? `data:${got.mimeType};base64,${got.data}` : '',
+      });
+    } catch (err) {
+      toast(`${f.name} 加不上：${err.message}`);
+    }
+  }
+  renderAtts();
+  syncSendState();
+}
+
+el('attach').onclick = () => el('file').click();
+el('file').onchange = async (e) => {
+  const files = [...(e.target.files || [])];
+  e.target.value = '';
+  if (files.length) await addFiles(files);
+};
+
 input.addEventListener('input', () => {
   input.style.height = 'auto';
   input.style.height = Math.min(input.scrollHeight, 132) + 'px';
-  sendBtn.disabled = !input.value.trim();
+  syncSendState();
 });
 sendBtn.onclick = () => {
   const text = input.value.trim();
-  if (!text || !openId) return;
-  send('session:send', { sessionId: openId, text });
+  if (!openId || (!text && atts.length === 0)) return;
+  const payload = { sessionId: openId, text };
+  if (atts.length) {
+    payload.attachments = atts.map((a) => ({ name: a.name, mimeType: a.mimeType, data: a.data }));
+  }
+  send('session:send', payload);
   input.value = '';
   input.style.height = 'auto';
-  sendBtn.disabled = true;
+  atts = [];
+  renderAtts();
+  syncSendState();
 };
 
 connect();
