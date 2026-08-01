@@ -196,6 +196,33 @@ check('谓词抛错被吞掉且不误投',
 cB.close();
 await wait(200);
 
+// 15c. 失败记录表有上界（原来只增不减）
+// 窗口过期的记录已经没有任何作用，留着只是占内存。
+relay.failures.clear();
+const NOW = Date.now();
+// 300 条已过期 + 1 条窗口内；再记一次失败会新增第 2 条窗口内记录并越过软上限触发清理，
+// 于是应当只剩那 2 条窗口内的
+for (let i = 0; i < 300; i++) relay.failures.set(`10.0.0.${i}`, { since: NOW - 120000, count: 3 });
+relay.failures.set('10.1.1.1', { since: NOW, count: 1 });
+const beforePrune = relay.failures.size;
+relay._noteFailure('10.2.2.2');
+check('超过软上限时清掉过期记录',
+  relay.failures.size === 2 && relay.failures.has('10.1.1.1') && relay.failures.has('10.2.2.2'),
+  `${beforePrune} → ${relay.failures.size}`);
+
+// 全都在窗口内还超硬上限 → 整表重置，保证有上界
+relay.failures.clear();
+for (let i = 0; i < 5000; i++) relay.failures.set(`10.9.${i >> 8}.${i & 255}`, { since: NOW, count: 1 });
+relay._pruneFailures(NOW);
+check('窗口内条数超硬上限时整表重置', relay.failures.size === 0, `size=${relay.failures.size}`);
+
+// 限速本身仍然生效（别把功能清没了）
+relay.failures.clear();
+relay.failures.set('10.3.3.3', { since: NOW, count: 999 });
+check('限速判定未被破坏', relay._rateLimited('10.3.3.3') === true);
+check('未记录过的 IP 不被限速', relay._rateLimited('10.4.4.4') === false);
+relay.failures.clear();
+
 // 16. urls() 在只绑 loopback 时不应含 LAN 地址
 const urls = relay.urls();
 check('bindLan=false 时只给 loopback', urls.length === 1 && urls[0].includes('127.0.0.1'),

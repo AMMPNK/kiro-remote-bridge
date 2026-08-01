@@ -89,8 +89,17 @@ function watchedSessionIds() {
   return ids;
 }
 let lastStatusKey = '';
-/** toolCallId -> {connection, requestId} 收到过的权限请求，用于细粒度响应 */
+/**
+ * toolCallId -> {connection, requestId, optionIds, at} 收到过的权限请求，用于细粒度响应。
+ *
+ * 必须会过期。原来只在手机端回应时删除，而实测有相当一部分请求会在 6~130ms 内被 agent
+ * 自己取消（不匹配白名单的命令），那些条目就永久留下了。两个后果：表只增不减，以及
+ * 对一个早已死掉的 requestId 调 respond —— agent 那边没人在等，手机上却会看到
+ * 「已批准」。后者比内存更值得修：它是一个假成功。
+ */
 const pendingPermissions = new Map();
+/** 权限请求的保留时长。与 sessionStore 的 WAITING_WINDOW_MS 对齐，人可能离开手机一会儿 */
+const PERMISSION_TTL_MS = 30 * 60 * 1000;
 /** 最近一次从 agent 响应里拿到的完整模型清单，见 MODELS_FILE */
 let modelOptions = [];
 /** 与上面同来源的默认模型，避免自己编一个默认值 */
@@ -662,7 +671,28 @@ async function sendToSession(sessionId, text, attachments) {
  * 细粒度：mux 送来过该 toolCallId 的 request_permission，就直接回它。
  * 粗粒度：否则用 runOrAcceptAll / rejectAll —— 注意这作用于当前活动会话的整批操作。
  */
+/** 丢掉过期的权限请求记录，并返回丢掉的条数 */
+function prunePendingPermissions(now = Date.now()) {
+  let n = 0;
+  for (const [id, rec] of pendingPermissions) {
+    if (now - (rec.at || 0) > PERMISSION_TTL_MS) {
+      pendingPermissions.delete(id);
+      n++;
+    }
+  }
+  if (n) log(`[approve] 清掉 ${n} 条过期的权限请求记录`);
+  return n;
+}
+
 async function respondPermission(toolCallId, approve) {
+  const stale = toolCallId && pendingPermissions.get(toolCallId);
+  if (stale && Date.now() - (stale.at || 0) > PERMISSION_TTL_MS) {
+    // 显式失败，不要退到整批命令：那会对当前活动会话执行 runOrAcceptAll，
+    // 作用范围远大于用户以为自己在批准的那一个工具调用。
+    pendingPermissions.delete(toolCallId);
+    log(`[approve] toolCallId=${toolCallId} 已过期，拒绝响应`);
+    throw new Error('这个请求已经过期了，没有生效。回到会话里看看当前状态。');
+  }
   if (toolCallId && pendingPermissions.has(toolCallId)) {
     const { connection, requestId, optionIds } = pendingPermissions.get(toolCallId);
     const optionId = approve ? optionIds.allow : optionIds.deny;
@@ -705,9 +735,11 @@ function onMuxInbound(m) {
       );
       return hit ? hit.optionId : null;
     };
+    prunePendingPermissions();
     pendingPermissions.set(toolCallId, {
       connection,
       requestId: id,
+      at: Date.now(),
       optionIds: { allow: find(/allow|approve|accept/i), deny: find(/reject|deny|cancel/i) },
     });
     log(`[mux] 收到权限请求 toolCallId=${toolCallId} options=${JSON.stringify(options).slice(0, 200)}`);
@@ -1089,4 +1121,13 @@ function deactivate() {
   if (muxPool) muxPool.dispose();
 }
 
-module.exports = { activate, deactivate };
+module.exports = {
+  activate,
+  deactivate,
+  /**
+   * 仅供测试。这些不是对外契约，可以随时改。
+   * 暴露出来是因为权限记账的失效形态是「对死掉的 requestId 回响应，手机上显示已批准」——
+   * 一个假成功，静态检查看不出来，只能靠真的走一遍。
+   */
+  __test: { pendingPermissions, prunePendingPermissions, respondPermission, PERMISSION_TTL_MS },
+};

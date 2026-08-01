@@ -29,6 +29,10 @@ const MIME = {
 /** 防暴力猜测：同一 IP 每分钟最多 60 次失败 */
 const FAIL_WINDOW_MS = 60000;
 const FAIL_LIMIT = 60;
+/** 超过这个条数就顺手清一次过期记录 */
+const FAIL_TABLE_SOFT_MAX = 256;
+/** 清完还超过这个条数就整表重置，保证内存有上界 */
+const FAIL_TABLE_HARD_MAX = 4096;
 
 /**
  * 公开资源：不校验 token 也能取。
@@ -98,6 +102,22 @@ class Relay {
       this.failures.set(ip, { since: now, count: 1 });
     } else {
       rec.count++;
+    }
+    // 顺手清掉过期条目。这张表原来只增不减：每个来过的 IP 都会留下一条记录，
+    // 而记录在窗口过期后已经没有任何作用。局域网里增长很慢，但没有上界。
+    if (this.failures.size > FAIL_TABLE_SOFT_MAX) this._pruneFailures(now);
+  }
+
+  /** 丢掉窗口已过期的记录；若仍然过大，说明正在被大量不同源打，整表重置 */
+  _pruneFailures(now = Date.now()) {
+    for (const [ip, rec] of this.failures) {
+      if (now - rec.since > FAIL_WINDOW_MS) this.failures.delete(ip);
+    }
+    // 全都在窗口内还超限，只能整表丢：宁可放宽限速，也不能让内存无上界。
+    // 这是刻意的取舍 —— 限速是为了拖慢暴力猜 token，而 token 有 256 位熵。
+    if (this.failures.size > FAIL_TABLE_HARD_MAX) {
+      this.log(`[relay] 失败记录表超过 ${FAIL_TABLE_HARD_MAX} 条，已重置`);
+      this.failures.clear();
     }
   }
 

@@ -145,6 +145,60 @@ check('autoStart 打开时注册 4 秒启动任务',
   timers.length === 1 && timers[0].ms === 4000,
   timers.map((t) => t.ms + 'ms').join(','));
 
+// ================================================================ 权限记账会过期
+// 失效形态是「假成功」：agent 早已取消该请求，bridge 仍对死掉的 requestId 回响应，
+// 手机上却显示已批准。所以要断言的是「过期的请求必须显式失败」，而不只是「表会变小」。
+{
+  const { pendingPermissions, prunePendingPermissions, respondPermission, PERMISSION_TTL_MS } =
+    ext.__test;
+  pendingPermissions.clear();
+
+  const responded = [];
+  const fakeConn = {
+    respond: (id, payload) => responded.push({ id, payload }),
+    respondError: (id, code, msg) => responded.push({ id, code, msg }),
+  };
+  const mk = (id, ageMs) => {
+    pendingPermissions.set(id, {
+      connection: fakeConn,
+      requestId: 'rpc-' + id,
+      at: Date.now() - ageMs,
+      optionIds: { allow: 'opt-allow', deny: 'opt-deny' },
+    });
+  };
+
+  mk('fresh', 1000);
+  mk('old', PERMISSION_TTL_MS + 60000);
+  check('过期记录会被清掉，新鲜的留下',
+    prunePendingPermissions() === 1 && pendingPermissions.has('fresh') &&
+    !pendingPermissions.has('old'), `剩 ${[...pendingPermissions.keys()].join(',')}`);
+
+  // 新鲜的照常走 mux 路径
+  responded.length = 0;
+  const okRes = await respondPermission('fresh', true);
+  check('新鲜请求走 mux 单条批准',
+    okRes && okRes.via === 'mux' && okRes.granularity === 'single' &&
+    responded.length === 1 && responded[0].payload.outcome.optionId === 'opt-allow',
+    JSON.stringify({ okRes, responded }));
+  check('批准后记录被移除', !pendingPermissions.has('fresh'));
+
+  // 过期的必须抛错，且绝不能对 agent 回响应
+  mk('stale', PERMISSION_TTL_MS + 60000);
+  responded.length = 0;
+  let threw = null;
+  try {
+    await respondPermission('stale', true);
+  } catch (e) { threw = e; }
+  check('过期请求显式失败', !!threw && /过期/.test(threw.message),
+    threw ? threw.message : '没有抛错');
+  check('过期请求不对 agent 回任何响应', responded.length === 0, JSON.stringify(responded));
+  check('过期请求的记录被清掉', !pendingPermissions.has('stale'));
+  // 关键：不能退回整批命令。runOrAcceptAll 的作用范围远大于用户以为的那一个工具调用
+  check('过期请求不会退化成整批批准',
+    !executed.includes('kiroAgent.execution.runOrAcceptAll'), executed.join(','));
+  pendingPermissions.clear();
+}
+
 // ================================================================ 声明与实现一致
 const pkg = JSON.parse(require_('node:fs').readFileSync(join(ROOT, 'package.json'), 'utf8'));
 const props = pkg.contributes.configuration.properties;
