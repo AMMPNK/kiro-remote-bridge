@@ -118,6 +118,97 @@ fs.appendFileSync(jsonl, ev({ type: 'turn_start', executionId: 'e12' }));
 d = store.tail('sess_test-tail');
 check('tail 带回最新 status', d.status === 'in_progress', d.status);
 
+// 11. readHistory 的尾部回读必须与全量读等价
+// readHistory 不再整份读文件，只回读尾部足够的字节。风险点是窗口起点会切断
+// renderEvents 的合并组（相邻同 executionId 的 assistant 片段会被并成一条），
+// 使窗口里的第一条比全量读时短。实现靠「要求窗口产出严格多于 limit 条」来吸收，
+// 这里把窗口调到极小，逼着它反复扩窗，验证结果仍与全量读逐字一致。
+{
+  const bigDir = path.join(root, 'wshash', 'sess_window');
+  fs.mkdirSync(bigDir, { recursive: true });
+  fs.writeFileSync(path.join(bigDir, 'session.json'), JSON.stringify({
+    id: 'sess_window', title: '窗口边界', status: 'idle', workspacePaths: ['/tmp/wsA'],
+  }));
+  const bigJsonl = path.join(bigDir, 'messages.jsonl');
+  // 刻意让 assistant 片段跨多行同 executionId，制造大量合并组
+  const lines = [];
+  for (let i = 0; i < 300; i++) {
+    lines.push(ev({ type: 'user', content: `问题 ${i}` }));
+    for (let k = 0; k < 3; k++) {
+      lines.push(ev({ type: 'assistant', content: `答${i}-${k} `, executionId: `e${i}`,
+        operationType: 'Say' }));
+    }
+  }
+  fs.writeFileSync(bigJsonl, lines.join(''));
+
+  /** 参照实现：整份读进来再 slice，与改动前的行为一致 */
+  const fullRead = (limit) => {
+    const events = [];
+    for (const line of fs.readFileSync(bigJsonl, 'utf8').split('\n')) {
+      if (!line.trim()) continue;
+      try { events.push(JSON.parse(line)); } catch (_) { /* 半行 */ }
+    }
+    let m = SessionStore.renderEvents(events);
+    const truncated = m.length > limit;
+    if (truncated) m = m.slice(-limit);
+    return { m, truncated };
+  };
+
+  class WindowStore extends SessionStore {
+    get root() { return root; }
+    listSessionDirs() { return [bigDir]; }
+  }
+
+  let allSame = true;
+  const detail = [];
+  /*
+   * 这几对 (窗口, limit) 是扫参数扫出来的：limit 恰好等于该窗口的产出条数。
+   * 这正是「严格大于」那个守卫唯一起作用的场合 —— 放松成 >= 就会把被切断的首条
+   * 留在结果里。不带这几对的话，等价性断言对 > 和 >= 两种实现都通过，
+   * 也就是说它并没有钉住这个守卫（第一版就是这样，变异测试才暴露出来）。
+   */
+  const BOUNDARY_PAIRS = [[200, 1], [644, 3], [681, 3], [385, 1]];
+  for (const [win, limit] of BOUNDARY_PAIRS) {
+    const s = new WindowStore(() => {});
+    s.historyWindow = win;
+    const got = s.readHistory('sess_window', limit);
+    const want = fullRead(limit);
+    if (JSON.stringify(got.messages) !== JSON.stringify(want.m)) {
+      allSame = false;
+      detail.push(`边界对 win=${win} limit=${limit}`);
+    }
+  }
+  for (const win of [64, 512, 4096, 65536]) {
+    for (const limit of [10, 50, 200, 5000]) {
+      const s = new WindowStore(() => {});
+      s.historyWindow = win;
+      const got = s.readHistory('sess_window', limit);
+      const want = fullRead(limit);
+      const sameMsg = JSON.stringify(got.messages) === JSON.stringify(want.m);
+      const sameTrunc = !!got.truncated === !!want.truncated;
+      if (!sameMsg || !sameTrunc) {
+        allSame = false;
+        detail.push(`win=${win} limit=${limit} 条数${got.messages.length}/${want.m.length} trunc${got.truncated}/${want.truncated}`);
+      }
+    }
+  }
+  check('极小窗口下尾部回读与全量读逐字一致', allSame, detail.slice(0, 3).join(' | '));
+
+  // 合并组确实存在，否则上面那条等价性是在一个没有边界风险的样本上通过的
+  const probe = new WindowStore(() => {});
+  const merged = probe.readHistory('sess_window', 5000).messages
+    .filter((m) => m.kind === 'message' && m.role === 'assistant');
+  check('样本里确实产生了合并（每组 3 段并成 1 条）',
+    merged.length === 300 && merged.every((m) => /答\d+-0 答\d+-1 答\d+-2 /.test(m.text)),
+    `${merged.length} 条助手消息`);
+
+  // 游标语义：回读之后紧接 tail 必须为空，否则手机上会重复收到已显示的内容
+  const cur = new WindowStore(() => {});
+  cur.historyWindow = 128;
+  cur.readHistory('sess_window', 50);
+  check('小窗口回读后 tail 仍为空', cur.tail('sess_window').messages.length === 0);
+}
+
 fs.rmSync(root, { recursive: true, force: true });
 console.log(`\n结果: ${pass} 通过 / ${fail} 失败`);
 process.exit(fail ? 1 : 0);

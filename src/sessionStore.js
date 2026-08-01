@@ -31,6 +31,13 @@ const SESSIONS_ROOT = path.join(os.homedir(), '.kiro', 'sessions');
  * 但两次事件之间的间隔通常远小于此。
  * WAITING 窗口取 30 分钟：卡在等批准可以等很久，但窗口关掉后就没有意义了。
  */
+/**
+ * readHistory 首次回读的字节数。
+ * 实测 18 个「历史足够长」的真实会话里，产出 400 条渲染消息所需的回读量中位 1383KB、
+ * 最大 8147KB。取 2MB 是为了让多数会话一次读够；不够时按密度估算再读一次。
+ * 这个值只影响读几次，不影响正确性。
+ */
+const HISTORY_WINDOW_BYTES = 2 * 1024 * 1024;
 const RUNNING_WINDOW_MS = 3 * 60 * 1000;
 const WAITING_WINDOW_MS = 30 * 60 * 1000;
 /** 从文件尾部回读的字节数，够覆盖最近若干个事件 */
@@ -80,6 +87,11 @@ class SessionStore {
     this.log = log || (() => {});
     /** 完整路径 -> {size, mtimeMs} 的读取游标，用于增量 tail */
     this.cursors = new Map();
+    /**
+     * readHistory 首次回读的字节数。做成实例属性是为了让测试能把它调到很小，
+     * 从而在小文件上覆盖「窗口起点切断合并组」这类边界，不必造几 MB 的样本。
+     */
+    this.historyWindow = HISTORY_WINDOW_BYTES;
   }
 
   get root() {
@@ -437,32 +449,97 @@ class SessionStore {
   }
 
   /** 读整个会话历史；tailLimit 只保留最后 N 条渲染消息 */
+  /**
+   * 读会话历史。只回读文件尾部足够的字节，而不是整份读进来。
+   *
+   * 为什么要这样：实测 35 个真实会话共 107MB，全量读的耗时中位 14.8ms、p90 39.6ms、
+   * 最大 69.8ms，17/35 会超过一帧（16ms）—— 而这是同步调用，期间扩展宿主完全阻塞，
+   * 触发它的只是手机上点一下会话。耗时随文件线性增长，没有上界。
+   *
+   * 正确性依据：renderEvents 是一次流式折叠，只有局部状态（按 executionId 合并相邻的
+   * assistant 片段），不依赖文件开头的任何东西。所以从中间开始读是安全的，只要处理好
+   * 两个边界：
+   *   1. 窗口起点可能落在某行中间 —— 总是从 start-1 读起并跳过第一个换行，
+   *      这样即使起点正好是记录边界也不会多丢一条。
+   *   2. 窗口起点可能切断一个合并组，使窗口里的**第一条**消息比全量读时短。
+   *      所以要求窗口产出严格多于 tailLimit 条，让受影响的那条被 slice 掉；
+   *      不够就把窗口翻倍重来，最坏退化成全量读（与旧行为一致）。
+   */
   readHistory(sessionId, tailLimit = 400) {
     const dir = this.findSessionDir(sessionId);
     if (!dir) return { sessionId, found: false, messages: [] };
     const meta = safeReadJson(path.join(dir, 'session.json')) || {};
     const jsonl = path.join(dir, 'messages.jsonl');
-    const events = [];
+
     let size = 0;
     try {
-      const raw = fs.readFileSync(jsonl, 'utf8');
-      size = Buffer.byteLength(raw, 'utf8');
-      for (const line of raw.split('\n')) {
-        if (!line.trim()) continue;
-        try {
-          events.push(JSON.parse(line));
-        } catch (_) {
-          /* 跳过写入中途的半行 */
-        }
-      }
+      size = fs.statSync(jsonl).size;
     } catch (_) {
-      /* 没有 messages.jsonl */
+      /* 没有 messages.jsonl，下面按空历史处理 */
     }
-    // 记录游标，后续 tail 只读新增字节
+
+    let messages = [];
+    let fromStart = true;
+    if (size > 0) {
+      let window = Math.max(1, this.historyWindow || HISTORY_WINDOW_BYTES);
+      for (;;) {
+        const start = Math.max(0, size - window);
+        // 起点非 0 时多读 1 字节，用来判断起点前面是不是换行
+        const readFrom = start > 0 ? start - 1 : 0;
+        let chunk = '';
+        let fd;
+        try {
+          fd = fs.openSync(jsonl, 'r');
+          const buf = Buffer.alloc(size - readFrom);
+          fs.readSync(fd, buf, 0, buf.length, readFrom);
+          chunk = buf.toString('utf8');
+        } catch (_) {
+          break;
+        } finally {
+          if (fd !== undefined) {
+            try {
+              fs.closeSync(fd);
+            } catch (_) {
+              /* ignore */
+            }
+          }
+        }
+        if (readFrom > 0) {
+          // 跳到第一个换行之后，保证从完整记录开始
+          const nl = chunk.indexOf('\n');
+          chunk = nl < 0 ? '' : chunk.slice(nl + 1);
+        }
+        fromStart = start === 0;
+        const events = [];
+        for (const line of chunk.split('\n')) {
+          if (!line.trim()) continue;
+          try {
+            events.push(JSON.parse(line));
+          } catch (_) {
+            /* 跳过写入中途的半行 */
+          }
+        }
+        messages = SessionStore.renderEvents(events);
+        // 严格大于：多出来的那条用于吸收「窗口起点切断合并组」的误差
+        if (fromStart || messages.length > tailLimit) break;
+        /*
+         * 按实测密度估算下一个窗口，而不是盲目翻倍。
+         *
+         * 实测 18 个够 400 条的会话，所需回读字节中位 1383KB、最大 8147KB，一半超过 1MB。
+         * 盲目 ×4 会让「需要 4.5MB」的会话依次读 1MB→4MB→16MB，解析量是下限的近 5 倍。
+         * 用密度估一次通常一步到位。乘 2 是留余量，并强制至少翻倍以保证收敛。
+         */
+        const perMsg = messages.length > 0 ? window / messages.length : window;
+        const guess = Math.ceil(perMsg * (tailLimit + 1) * 2);
+        window = Math.max(window * 2, guess);
+        if (window >= size) window = size;
+      }
+    }
+
+    // 游标记到文件真实末尾，后续 tail 只读新增字节（与是否回读无关）
     this.cursors.set(jsonl, size);
-    let messages = SessionStore.renderEvents(events);
-    const truncated = messages.length > tailLimit;
-    if (truncated) messages = messages.slice(-tailLimit);
+    const truncated = !fromStart || messages.length > tailLimit;
+    if (messages.length > tailLimit) messages = messages.slice(-tailLimit);
     return {
       sessionId: meta.id || sessionId,
       found: true,
