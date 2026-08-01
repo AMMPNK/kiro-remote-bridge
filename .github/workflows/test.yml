@@ -1,0 +1,54 @@
+name: test
+
+# 这个仓库的一致性门禁做得不少（t8 检查前后端消息类型对齐、package.js 双向校验白名单），
+# 但在此之前没有任何自动触发点 —— 门禁只在有人记得跑 npm test 时才生效。
+on:
+  push:
+    branches: ['**']
+  pull_request:
+  workflow_dispatch:
+
+defaults:
+  run:
+    # 必须显式写 bash：默认 shell 只有 -e，没有 pipefail。
+    # 下面 `node test/run-all.mjs | tee` 里 tee 总是返回 0，缺 pipefail 的话
+    # 测试失败会被 tee 的退出码盖掉，流水线在测试红的情况下报绿。
+    shell: bash
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      # 没有运行时依赖，所以不需要 npm ci —— 测试全部只用 Node 标准库。
+      # 只跑一次并把输出留下来给下一步复核，避免同一套测试跑两遍。
+      - name: 跑全量测试
+        run: node test/run-all.mjs | tee /tmp/testout.txt
+
+      # CI 上没有 ~/.kiro/sessions，t1-store 会走 SKIP 分支。这一步确认它确实是 SKIP
+      # 而不是静默通过 —— 「一条都没验」和「验过且通过」必须能区分开，否则这条流水线
+      # 会在什么都没测的情况下报绿。
+      #
+      # 全部用 if 写，不用 `grep && { }`：后者在 grep 未命中时整个 AND 链返回 1，
+      # 而 run 是在 -e 下执行的，会把「检查通过」当成步骤失败。
+      - name: 复核跳过与空断言
+        run: |
+          if ! grep -q '\[SKIP\] t1-store' /tmp/testout.txt; then
+            echo "预期 t1-store 在 CI 上走 SKIP 分支（这里没有 ~/.kiro/sessions），实际不是："
+            grep 't1-store' /tmp/testout.txt || true
+            exit 1
+          fi
+          if grep -q 'EMPTY' /tmp/testout.txt; then
+            echo "有测试文件没有输出任何断言结果（EMPTY），拒绝通过："
+            grep -n 'EMPTY' /tmp/testout.txt
+            exit 1
+          fi
+          echo "OK：t1-store 显式跳过，且没有 EMPTY 文件"
+
+      - name: 打包（含白名单与必需项双向校验）
+        run: node scripts/package.js
