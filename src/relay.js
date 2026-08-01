@@ -276,8 +276,14 @@ class Relay {
     }
   }
 
-  broadcast(obj) {
-    this.wss.broadcastJson(obj);
+  /**
+   * @param {object} obj
+   * @param {{droppable?: boolean}} [opts] 周期性全量快照（sessions / status）应传
+   *   droppable，积压时可以直接丢 —— 下一个周期会带来更新的同一份数据。
+   *   delta / history 不要传：丢掉就永久少了几条消息，而界面上看不出来。
+   */
+  broadcast(obj, opts) {
+    return this.wss.broadcastJson(obj, opts);
   }
 
   /**
@@ -286,7 +292,7 @@ class Relay {
    * 另一台手机会收到它没打开的会话的内容，靠前端自己丢掉。能耗和流量都是白花的，
    * 而且历史消息可能有几 MB。
    */
-  broadcastTo(pred, obj) {
+  broadcastTo(pred, obj, opts) {
     let n = 0;
     for (const conn of this.wss.connections) {
       let want = false;
@@ -295,7 +301,7 @@ class Relay {
       } catch (_) {
         want = false;
       }
-      if (want && conn.sendJson(obj) !== false) n++;
+      if (want && conn.sendJson(obj, opts) !== false) n++;
     }
     return n;
   }

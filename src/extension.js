@@ -765,8 +765,13 @@ function onMuxInbound(m) {
       const sid = params && params.sessionId;
       // 带得出 sessionId 就只发给在看它的那台手机；带不出就退回广播，
       // 由前端按 sessionId 自己过滤（原来的行为）。
-      if (sid) relay.broadcastTo((c) => c.watchedSessionId === sid, { type: 'muxUpdate', params });
-      else relay.broadcast({ type: 'muxUpdate', params });
+      // droppable：流式增量只是体验，权威内容由 tail 兜住，丢掉不会少内容
+      const opts = { droppable: true };
+      if (sid) {
+        relay.broadcastTo((c) => c.watchedSessionId === sid, { type: 'muxUpdate', params }, opts);
+      } else {
+        relay.broadcast({ type: 'muxUpdate', params }, opts);
+      }
     }
     return;
   }
@@ -825,13 +830,14 @@ function startPolling() {
       const key = `${st.state}|${st.running}|${st.waiting}`;
       if (key !== lastStatusKey) {
         lastStatusKey = key;
-        relay.broadcast({ type: 'status', ...st, mux: muxSummary() });
+        relay.broadcast({ type: 'status', ...st, mux: muxSummary() }, { droppable: true });
         setStatus(
           `$(radio-tower) Bridge ${st.state}`,
           `远程会话运行中\n状态: ${st.state}\n手机端: ${relay.clientCount} 个`
         );
       }
-      relay.broadcast({ type: 'sessions', items });
+      // 17KB 一帧、每 5 秒一次。对端不在收的时候没必要继续堆，下一轮的数据更新
+      relay.broadcast({ type: 'sessions', items }, { droppable: true });
     } catch (err) {
       log(`[list] 失败: ${err && err.message}`);
     }
@@ -883,6 +889,12 @@ async function collectDiagnostics() {
           port: relay.port,
           bindLan: relay.bindLan,
           clients: relay.clientCount,
+          // 每个客户端的积压与丢帧数。「手机看着像卡住了」以前在这里查不到任何线索
+          clientBuffers: [...relay.connections].map((c) => ({
+            buffered: c.bufferedBytes,
+            dropped: c.dropped || 0,
+            slowForMs: c.slowSince ? Date.now() - c.slowSince : 0,
+          })),
           // 只记地址形状，不落 token
           urls: relay.urls().map((u) => u.replace(/token=[^&]+/, 'token=<redacted>')),
         }

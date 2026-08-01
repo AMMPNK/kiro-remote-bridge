@@ -107,6 +107,52 @@ check('server 连接表已清空', wss.connections.size === 0, `size=${wss.conne
 
 server.close();
 
+// 9b. 背压：可丢弃帧在积压时被丢掉，不可丢弃帧照旧排队
+// 关键是两个方向都要测。只测「会丢」的话，把 delta 也标成 droppable 一样能通过，
+// 而那会静默丢掉聊天内容 —— 游标已经推进，界面上看不出少了几条。
+{
+  const { WsConnection } = require('./src/wsServer.js');
+  // 假 socket：write 永远返回 false（内核缓冲已满），writableLength 由我们控制
+  const fakeSocket = {
+    destroyed: false,
+    writableLength: 0,
+    written: 0,
+    on() {},
+    write(buf) { this.written += buf.length; return false; },
+    destroy() { this.destroyed = true; },
+    end() {},
+  };
+  const c2 = new WsConnection(fakeSocket, {});
+
+  // 未积压时，可丢弃帧照常发出
+  fakeSocket.writableLength = 0;
+  const r1 = c2.sendJson({ type: 'sessions' }, { droppable: true });
+  check('未积压时可丢弃帧照常发出', r1 === false && c2.dropped === undefined && fakeSocket.written > 0,
+    `write 返回 ${r1}（socket 满，但帧已交出）written=${fakeSocket.written}`);
+
+  // 积压超过高水位后，可丢弃帧被丢掉（不再往 socket 写）
+  fakeSocket.writableLength = 2 * 1024 * 1024;
+  const wroteBefore = fakeSocket.written;
+  c2.sendJson({ type: 'sessions' }, { droppable: true });
+  c2.sendJson({ type: 'status' }, { droppable: true });
+  check('积压时可丢弃帧被丢掉', c2.dropped === 2 && fakeSocket.written === wroteBefore,
+    `dropped=${c2.dropped} written 增量=${fakeSocket.written - wroteBefore}`);
+
+  // 同样积压下，不可丢弃帧必须仍然发出
+  const wroteBefore2 = fakeSocket.written;
+  c2.sendJson({ type: 'delta', messages: [{ kind: 'message' }] });
+  check('积压时不可丢弃帧仍然发出',
+    fakeSocket.written > wroteBefore2 && c2.dropped === 2,
+    `written 增量=${fakeSocket.written - wroteBefore2} dropped=${c2.dropped}`);
+
+  // slowSince 要能反映「已经慢了多久」，否则这个状态在服务端不可观测
+  check('slowSince 已记录', typeof c2.slowSince === 'number' && c2.slowSince > 0,
+    String(c2.slowSince));
+  check('bufferedBytes 读得到积压量', c2.bufferedBytes === 2 * 1024 * 1024,
+    String(c2.bufferedBytes));
+  c2.terminate();
+}
+
 // 10. 帧上限只能有一个事实源
 // 手机端的附件预算按服务端在 hello 里报来的 maxPayload 算。它还留了一份兜底数字，
 // 供拿不到 hello 时使用 —— 这条闸门盯着那份兜底值不要和服务端脱节。

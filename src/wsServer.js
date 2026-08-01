@@ -22,6 +22,12 @@ const OP_PING = 0x9;
 const OP_PONG = 0xa;
 /** 单帧上限，防止恶意超大 payload 打爆内存 */
 const MAX_PAYLOAD = 8 * 1024 * 1024;
+/**
+ * 积压超过这个字节数后，可丢弃的周期性帧就不再往队列里堆。
+ * 取 512KB：正常局域网下 writableLength 基本是 0，能持续到这个量级就说明对端确实
+ * 不在收了（心跳会在约 60 秒后收掉连接）。
+ */
+const HIGH_WATER_BYTES = 512 * 1024;
 
 function acceptKey(key) {
   return crypto.createHash('sha1').update(key + GUID).digest('base64');
@@ -198,20 +204,42 @@ class WsConnection extends EventEmitter {
   }
 
   _sendRaw(opcode, payload) {
-    if (this.closed || this.socket.destroyed) return;
+    if (this.closed || this.socket.destroyed) return false;
     try {
-      this.socket.write(encodeFrame(opcode, payload));
+      // 返回值刻意向上传。socket.write 返回 false 表示这一帧进了 Node 的内存队列而不是
+      // 内核缓冲 —— 原来这个返回值被丢掉，于是「手机走进隧道」这种状态在服务端完全
+      // 不可观测（心跳会在约 60 秒后收掉连接，但期间的积压看不见也说不清）。
+      const ok = this.socket.write(encodeFrame(opcode, payload));
+      this.slowSince = ok ? 0 : this.slowSince || Date.now();
+      return ok;
     } catch (_) {
       this.terminate();
+      return false;
     }
   }
 
-  send(text) {
-    this._sendRaw(OP_TEXT, Buffer.from(String(text), 'utf8'));
+  /** 还积压在 Node 内存队列里的字节数（尚未进内核缓冲的部分） */
+  get bufferedBytes() {
+    return (this.socket && this.socket.writableLength) || 0;
   }
 
-  sendJson(obj) {
-    this.send(JSON.stringify(obj));
+  /**
+   * @param {string} text
+   * @param {{droppable?: boolean}} [opts] droppable：这一帧丢掉不造成信息损失
+   */
+  send(text, opts) {
+    // 只有「周期性全量快照」允许丢，因为下一个周期会带来更新的同一份数据。
+    // delta / history 绝不能丢 —— store 的游标已经推进，丢掉就永久少了几条消息，
+    // 而界面上完全看不出来。这类帧宁可继续排队，让心跳去判定连接死没死。
+    if (opts && opts.droppable && this.bufferedBytes > HIGH_WATER_BYTES) {
+      this.dropped = (this.dropped || 0) + 1;
+      return false;
+    }
+    return this._sendRaw(OP_TEXT, Buffer.from(String(text), 'utf8'));
+  }
+
+  sendJson(obj, opts) {
+    return this.send(JSON.stringify(obj), opts);
   }
 
   ping() {
@@ -278,9 +306,11 @@ class WsServer extends EventEmitter {
     this.emit('connection', conn, req);
   }
 
-  broadcastJson(obj) {
+  broadcastJson(obj, opts) {
     const text = JSON.stringify(obj);
-    for (const c of this.connections) c.send(text);
+    let n = 0;
+    for (const c of this.connections) if (c.send(text, opts) !== false) n++;
+    return n;
   }
 
   closeAll() {
