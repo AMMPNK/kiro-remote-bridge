@@ -73,8 +73,21 @@ let relay;
 let statusBar;
 let tailTimer;
 let listTimer;
-/** 手机端当前打开的会话，只 tail 这一个，避免全量扫 */
-let watchedSessionId = null;
+/**
+ * 手机端打开的会话记在**连接上**（conn.watchedSessionId），不再是一个全局值。
+ *
+ * 原来是全局单值：第二台手机打开另一个会话，会把第一台的 tail 抢走 —— 第一台就此
+ * 静默停止更新，界面上没有任何异常提示。而 delta 又是广播给所有客户端的，等于每台
+ * 手机都收到别人会话的内容再自己丢掉。
+ */
+function watchedSessionIds() {
+  const ids = new Set();
+  if (!relay) return ids;
+  for (const conn of relay.connections) {
+    if (conn.watchedSessionId) ids.add(conn.watchedSessionId);
+  }
+  return ids;
+}
 let lastStatusKey = '';
 /** toolCallId -> {connection, requestId} 收到过的权限请求，用于细粒度响应 */
 const pendingPermissions = new Map();
@@ -84,8 +97,11 @@ let modelOptions = [];
 let modelCurrent;
 /** caffeinate 子进程，阻止空闲休眠；中继停止时释放 */
 let awake;
-/** 当前已订阅的 {sessionId, port}。port 变了说明 mux 重连过，订阅已失效 */
-let subscribedTo = { sessionId: null, port: null };
+/**
+ * 已订阅的会话：sessionId -> port。port 变了说明 mux 重连过，订阅已失效。
+ * 用 Map 而不是单值，因为多台手机可以同时各看一个会话。
+ */
+const subscribedTo = new Map();
 /** activate 时存下来，轮换 token 后要用它重启中继 */
 let extContext;
 
@@ -114,9 +130,10 @@ function buildHandlers() {
 
     'sessions:list': async () => ({ type: 'sessions', items: store.listSessions() }),
 
-    'session:open': async (msg) => {
+    'session:open': async (msg, conn) => {
       const sessionId = String(msg.sessionId || '');
-      watchedSessionId = sessionId;
+      // 记在连接上：另一台手机打开别的会话时，这一台的 tail 不受影响
+      if (conn) conn.watchedSessionId = sessionId;
       // 必须订阅：agent 只把权限请求和 session/update 发给已订阅该会话的客户端。
       // 不订阅的话，电脑侧发起的会话在手机上永远等不到授权框（只能看到从文件读出的
       // 「待确认」历史卡片，没有按钮），流式思维链也不会有。
@@ -214,11 +231,11 @@ function subscribeSession(sessionId) {
   const port = conn.endpoint.port;
   const probe = () => conn.request('_kiro/session/history', { sessionId, limit: 1 });
   const ok = () => {
-    subscribedTo = { sessionId, port };
+    subscribedTo.set(sessionId, port);
     log(`[subscribe] 已订阅 ${sessionId}（port=${port}）`);
   };
   probe().then(ok, async (err) => {
-    subscribedTo = { sessionId: null, port: null };
+    subscribedTo.delete(sessionId);
     // 重启后 agent 不认识旧会话，订阅也会失败。让桌面加载一次再试一遍。
     if (isSessionUnknown(err)) {
       log(`[subscribe] agent 不认识 ${sessionId}，先让桌面加载`);
@@ -239,13 +256,17 @@ function subscribeSession(sessionId) {
  * 所以定期核对一次：会话变了、或者连接换了端口（意味着重连过），就重新订阅。
  */
 function ensureSubscribed() {
-  if (!watchedSessionId) return;
-  const conn = muxPool.pickForWorkspace(workspaceOfSession(watchedSessionId));
-  if (!conn) return;
-  if (subscribedTo.sessionId === watchedSessionId && subscribedTo.port === conn.endpoint.port) {
-    return;
+  const watched = watchedSessionIds();
+  // 没人再看的会话要从记账里删掉，否则这个 Map 会随手机开过的会话数一直长
+  for (const id of [...subscribedTo.keys()]) {
+    if (!watched.has(id)) subscribedTo.delete(id);
   }
-  subscribeSession(watchedSessionId);
+  for (const sessionId of watched) {
+    const conn = muxPool.pickForWorkspace(workspaceOfSession(sessionId));
+    if (!conn) continue;
+    if (subscribedTo.get(sessionId) === conn.endpoint.port) continue;
+    subscribeSession(sessionId);
+  }
 }
 
 /** 从历史会话里聚合出用过的模型，按出现次数排序。这是确定可用的兜底来源。 */
@@ -703,7 +724,13 @@ function onMuxInbound(m) {
   }
   // 流式更新：mux 会把订阅会话的增量推过来。这里只转发，渲染交给手机端。
   if (/session\/update|sessionUpdate/i.test(method)) {
-    if (relay) relay.broadcast({ type: 'muxUpdate', params });
+    if (relay) {
+      const sid = params && params.sessionId;
+      // 带得出 sessionId 就只发给在看它的那台手机；带不出就退回广播，
+      // 由前端按 sessionId 自己过滤（原来的行为）。
+      if (sid) relay.broadcastTo((c) => c.watchedSessionId === sid, { type: 'muxUpdate', params });
+      else relay.broadcast({ type: 'muxUpdate', params });
+    }
     return;
   }
   if (id !== undefined) {
@@ -730,19 +757,23 @@ function muxSummary() {
 function startPolling() {
   stopPolling();
   tailTimer = setInterval(() => {
-    if (!relay || relay.clientCount === 0 || !watchedSessionId) return;
-    try {
-      const d = store.tail(watchedSessionId);
-      if (d.messages && d.messages.length) {
-        relay.broadcast({
+    if (!relay || relay.clientCount === 0) return;
+    // 每台手机各看一个会话，逐个 tail。store.cursors 是按文件路径记的，
+    // 多个会话并行 tail 互不干扰。
+    for (const sessionId of watchedSessionIds()) {
+      try {
+        const d = store.tail(sessionId);
+        if (!d.messages || !d.messages.length) continue;
+        // 只发给正在看这个会话的连接
+        relay.broadcastTo((c) => c.watchedSessionId === sessionId, {
           type: d.reset ? 'history' : 'delta',
           sessionId: d.sessionId,
           status: d.status,
           messages: d.messages,
         });
+      } catch (err) {
+        log(`[tail] ${sessionId} 失败: ${err && err.message}`);
       }
-    } catch (err) {
-      log(`[tail] 失败: ${err && err.message}`);
     }
   }, TAIL_INTERVAL_MS);
 
@@ -936,7 +967,7 @@ async function stop() {
   }
   muxPool.dispose();
   pendingPermissions.clear();
-  watchedSessionId = null;
+  subscribedTo.clear();
   setStatus('$(circle-slash) Bridge off', '远程会话已停止');
 }
 

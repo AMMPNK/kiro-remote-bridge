@@ -23,6 +23,8 @@ const relay = new Relay({
     __onConnect: (conn) => { calls.push('connect'); conn.sendJson({ type: 'hello' }); },
     'ping:test': async (msg) => { calls.push('ping:test'); return { type: 'pong', echo: msg.v }; },
     'boom': async () => { throw new Error('intentional failure'); },
+    // 照 session:open 的做法把关注的会话记在连接上，用于验证 broadcastTo
+    'watch': async (msg, conn) => { conn.watchedSessionId = msg.sessionId; return { type: 'watched' }; },
   },
 });
 
@@ -141,6 +143,58 @@ check('broadcast 到达客户端', msgs.some((m) => m.type === 'status' && m.sta
 
 // 15. clientCount
 check('clientCount 计数正确', relay.clientCount === 1, `count=${relay.clientCount}`);
+
+// 15b. broadcastTo：两台手机各看一个会话，会话级推送不能互相串台
+// 这是「第二台手机把第一台的 tail 抢走」那个缺陷的回归闸门。缺陷形态是静默的：
+// 第一台只是停止更新，界面上没有任何异常。
+const msgsB = [];
+const cB = new WsClient(`ws://127.0.0.1:${port}/?token=${encodeURIComponent(T)}`, { timeoutMs: 4000 });
+cB.on('message', (m) => msgsB.push(JSON.parse(m)));
+await new Promise((r) => { cB.on('open', r); cB.on('error', r); });
+await wait(150);
+check('第二个客户端已连上', relay.clientCount === 2, `count=${relay.clientCount}`);
+
+c.sendJson({ type: 'watch', sessionId: 'sess-A' });
+cB.sendJson({ type: 'watch', sessionId: 'sess-B' });
+await wait(200);
+const watched = [...relay.connections].map((x) => x.watchedSessionId).sort();
+check('两个连接各自记住了自己的会话',
+  watched.length === 2 && watched[0] === 'sess-A' && watched[1] === 'sess-B',
+  JSON.stringify(watched));
+
+msgs.length = 0;
+msgsB.length = 0;
+const sentN = relay.broadcastTo((x) => x.watchedSessionId === 'sess-A',
+  { type: 'delta', sessionId: 'sess-A', messages: [{ kind: 'message' }] });
+await wait(200);
+check('broadcastTo 只投给 1 个连接', sentN === 1, `返回 ${sentN}`);
+check('看 sess-A 的客户端收到了', msgs.some((m) => m.type === 'delta' && m.sessionId === 'sess-A'));
+check('看 sess-B 的客户端没收到', !msgsB.some((m) => m.type === 'delta'),
+  JSON.stringify(msgsB));
+
+// 反方向：给 sess-B 推，只有 B 收到
+msgs.length = 0;
+msgsB.length = 0;
+relay.broadcastTo((x) => x.watchedSessionId === 'sess-B', { type: 'delta', sessionId: 'sess-B' });
+await wait(200);
+check('反方向同样只投给对应连接',
+  msgsB.some((m) => m.type === 'delta' && m.sessionId === 'sess-B') &&
+  !msgs.some((m) => m.type === 'delta'),
+  `A=${JSON.stringify(msgs)} B=${JSON.stringify(msgsB)}`);
+
+// 谓词抛错不能打挂广播，也不能误投
+msgs.length = 0;
+msgsB.length = 0;
+let threw = false;
+try {
+  relay.broadcastTo(() => { throw new Error('pred boom'); }, { type: 'delta', sessionId: 'x' });
+} catch (_) { threw = true; }
+await wait(150);
+check('谓词抛错被吞掉且不误投',
+  !threw && !msgs.some((m) => m.type === 'delta') && !msgsB.some((m) => m.type === 'delta'));
+
+cB.close();
+await wait(200);
 
 // 16. urls() 在只绑 loopback 时不应含 LAN 地址
 const urls = relay.urls();

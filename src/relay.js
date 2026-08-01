@@ -260,6 +260,31 @@ class Relay {
     this.wss.broadcastJson(obj);
   }
 
+  /**
+   * 只发给满足条件的连接。
+   * 会话级的推送（history / delta / muxUpdate）都该走这条 —— 广播给全部客户端时，
+   * 另一台手机会收到它没打开的会话的内容，靠前端自己丢掉。能耗和流量都是白花的，
+   * 而且历史消息可能有几 MB。
+   */
+  broadcastTo(pred, obj) {
+    let n = 0;
+    for (const conn of this.wss.connections) {
+      let want = false;
+      try {
+        want = !!pred(conn);
+      } catch (_) {
+        want = false;
+      }
+      if (want && conn.sendJson(obj) !== false) n++;
+    }
+    return n;
+  }
+
+  /** 当前连接集合，供上层做按连接的状态归集 */
+  get connections() {
+    return this.wss.connections;
+  }
+
   get clientCount() {
     return this.wss.connections.size;
   }
