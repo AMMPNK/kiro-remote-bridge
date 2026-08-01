@@ -223,6 +223,9 @@
     background:var(--blue);color:#fff;font-size:17px;display:flex;align-items:center;
     justify-content:center;padding:0}
   .sendbtn:disabled{background:var(--card2);color:var(--faint)}
+  /* 停止键：红色是为了让它和「发送」在肌肉记忆上分开，两者占同一个位置 */
+  .sendbtn.stop{background:var(--red);font-size:12px}
+  .sendbtn.stop:active{background:#c93c33}
 
   /* ---------- 新建会话面板 ---------- */
   #sheet{position:fixed;inset:0;z-index:50}
@@ -352,6 +355,12 @@
       </div>
       <textarea id="input" rows="1" placeholder="发消息…"></textarea>
       <button class="sendbtn" id="send" disabled aria-label="发送">↑</button>
+      <!--
+        停止键顶替发送键，而不是并排多一个按钮：同一时刻只有一个动作是有意义的。
+        这是「人离开桌子后 agent 跑偏了」唯一的自救手段 —— 后端一直支持 session:cancel，
+        只是此前没有任何入口能发出它。
+      -->
+      <button class="sendbtn stop hide" id="stop" aria-label="停止本轮">■</button>
     </div>
     <!--
       两个入口而不是一个：Android 上 input[type=file] 不带 accept 时，多数浏览器会弹
@@ -424,6 +433,16 @@ function paintDot() {
   dotEl.className = connected ? 'dot ' + (agentBusy || 'on') : 'dot off';
 }
 let sessions = [], view = 'list', openId = null, openTitle = '';
+/**
+ * 当前会话是否有正在跑的回合 —— 决定输入区显示「发送」还是「停止」。
+ *
+ * 判据要多路合并，因为没有任何单一信号是及时且可靠的：
+ *   列表推送   权威但有最多 5 秒延迟，且刚发出时文件还没落盘
+ *   mux 增量   最及时，但只在 mux 通道可用时有
+ *   turnEnd    结束的确定信号
+ * 所以偏向「宁可多显示」：漏显示会让人在最需要停的时候没得可点。
+ */
+let turnActive = false, lastSendAt = 0;
 let sessionsSig = '', searchQ = '';
 let lastStatus = { state: 'idle', running: 0, waiting: 0 };
 /** 进入会话前所在的页面，决定返回键回到哪里 */
@@ -700,6 +719,8 @@ function openSession(sessionId, from) {
   el('searchWrap').classList.add('hide');
   el('composer').classList.remove('hide');
   mainEl.innerHTML = '<div class="sys">加载历史…</div>';
+  // 进来就按列表的判断定一次：最常见的场景正是「电脑上跑着，人从手机进来看」
+  setTurnActive(!!s && liveOf(s) === 'running');
   send('session:open', { sessionId, limit: 400 });
 }
 
@@ -869,6 +890,8 @@ function applyMuxUpdate(params) {
   const c = u.content;
   const text = c && c.type === 'text' ? c.text : '';
   if (!text) return;
+  // 有增量在推 = 这一轮确实在跑，这是最及时的一路信号
+  setTurnActive(true);
   if (u.sessionUpdate === 'agent_thought_chunk') streamThought(text);
   else if (u.sessionUpdate === 'agent_message_chunk') streamSay(text);
 }
@@ -1000,6 +1023,8 @@ function renderHistory(msgs, truncated) {
 
 function appendDelta(msgs) {
   reconcilePending(msgs);
+  // turnEnd 是回合结束的确定信号，比列表推送早、也比它可靠
+  if (msgs.some((m) => m.kind === 'turnEnd')) setTurnActive(false);
   // tail 带来了权威内容（思考或正文），或回合已结束 → 撤掉实时占位，避免同一段出现两遍。
   // 必须在下面的合并循环之前做：否则权威的 .arow 会被并进占位块而不是替换它。
   if (
@@ -1049,6 +1074,32 @@ function appendDelta(msgs) {
 
 const scrollBottom = () =>
   requestAnimationFrame(() => { mainEl.scrollTop = mainEl.scrollHeight; });
+
+// ---------------------------------------------------------------- 停止本轮
+function setTurnActive(v) {
+  if (v === turnActive) return;
+  turnActive = v;
+  el('send').classList.toggle('hide', v);
+  el('stop').classList.toggle('hide', !v);
+}
+
+/**
+ * 用列表推送校正一次。只在「确认还在跑」时开，关掉要多等一会儿 ——
+ * 刚发出去的那几秒 messages.jsonl 还没落盘，列表会说 idle，而那正是最需要停止键的时候。
+ */
+function syncTurnFromList() {
+  const s = sessions.find((x) => x.sessionId === openId);
+  if (!s) return;
+  if (liveOf(s) === 'running') setTurnActive(true);
+  else if (Date.now() - lastSendAt > 12000) setTurnActive(false);
+}
+
+el('stop').onclick = () => {
+  if (!openId) return;
+  send('session:cancel', { sessionId: openId });
+  // 不等应答就先收起：点了没反应最容易让人连点，而 cancel 是 notify，没有成功回执
+  setTurnActive(false);
+};
 
 // ---------------------------------------------------------------- 待批准
 let pendingItem = null;
@@ -1141,13 +1192,20 @@ function connect() {
     switch (m.type) {
       case 'sessions': {
         const next = m.items || [];
+        // live 必须进签名。它是后端按时间窗算的，会在文件完全没动的情况下自己
+        // 从 running 翻成 idle —— 不进签名的话那次翻转永远不会被渲染，列表上的
+        // 「运行中」徽标会一直挂着。
         const sig = next.map((s) =>
-          `${s.sessionId}:${s.lastActiveAt}:${s.status}:${s.bytes}`).join('|');
-        if (sig === sessionsSig) break;
-        sessionsSig = sig;
-        sessions = next;
-        if (view === 'list') renderList(true);
-        else if (view === 'archived') renderArchived();
+          `${s.sessionId}:${s.lastActiveAt}:${s.status}:${s.bytes}:${s.live || ''}`).join('|');
+        if (sig !== sessionsSig) {
+          sessionsSig = sig;
+          sessions = next;
+          if (view === 'list') renderList(true);
+          else if (view === 'archived') renderArchived();
+        }
+        // 刻意放在签名判断之外：会话安静下来之后签名就不再变化，而那恰恰是需要把
+        // 停止键收回去的时刻。卡在「停止」上的代价是发送键消失，人就再也发不出消息。
+        if (view === 'chat') syncTurnFromList();
         break;
       }
       case 'status':
@@ -1172,6 +1230,11 @@ function connect() {
           (m.attachments ? `已发送（含 ${m.attachments} 个附件）` : '已发送') +
             (m.via === 'mux' ? '' : '（命令通道）')
         );
+        setTurnActive(true);
+        break;
+      case 'cancelled':
+        toast('已请求停止');
+        setTurnActive(false);
         break;
       // 「已发出」不等于「已被接受」—— 真实结局由 resolved 增量给出，见 reconcilePending
       case 'approved':
@@ -1531,6 +1594,9 @@ sendBtn.onclick = () => {
     payload.attachments = atts.map((a) => ({ name: a.name, mimeType: a.mimeType, data: a.data }));
   }
   send('session:send', payload);
+  // 乐观置位：不等 sent 应答。这几秒里 agent 已经在跑，停止键必须已经可点
+  lastSendAt = Date.now();
+  setTurnActive(true);
   input.value = '';
   input.style.height = 'auto';
   atts = [];

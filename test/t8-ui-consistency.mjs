@@ -104,7 +104,6 @@ const relaySrc = readFileSync(join(ROOT, 'src', 'relay.js'), 'utf8');
 const NOT_IN_SWITCH = new Map([
   ['hello', '连接握手，随首屏推送一起到，前端不单独分支'],
   ['diagnostics', '自诊断应答，只在开发时查看，前端不请求'],
-  ['cancelled', 'session:cancel 的应答，而前端从不发这个请求'],
 ]);
 // 只认真正发往手机的出口：broadcast(…)、sendJson(…)、handler 的 return / 箭头直接返回。
 // 不能宽泛地抓所有 type: 'x' —— 后端还会构造 ACP 内容块（image / resource / text），
@@ -130,6 +129,25 @@ for (const tag of ['div', 'header', 'footer', 'main', 'svg']) {
   const close = (body.match(new RegExp(`</${tag}>`, 'g')) || []).length;
   check(`<${tag}> 标签配对`, open === close, `${open} 开 / ${close} 闭`);
 }
+
+// ---- 10. 停止键的两个已知失效方向
+// 这几条是针对具体缺陷的回归闸门，不是泛化检查：写这个按钮时两个方向各踩了一次。
+check('停止键会发出 session:cancel',
+  /el\('stop'\)\.onclick[\s\S]{0,240}?'session:cancel'/.test(script));
+
+// 方向一：停止键卡住 → 发送键消失 → 人再也发不出消息。
+// 触发条件是「会话安静下来后列表签名不再变化」，所以校正不能挂在签名判断里面。
+check('列表推送不会因签名未变而跳过停止键校正',
+  !/if\s*\(\s*sig\s*===\s*sessionsSig\s*\)\s*break/.test(script) &&
+  /if\s*\(view === 'chat'\) syncTurnFromList\(\)/.test(script));
+
+// 方向二：live 不在签名里 → 后端按时间窗把 running 翻成 idle 的那次翻转永远不渲染。
+check('live 已进入会话列表签名', /sig = next\.map[\s\S]{0,200}?s\.live/.test(script));
+
+// 停止键必须真的能被收回去：至少有一条路径把它置回 false
+check('存在把停止键收回的路径',
+  (script.match(/setTurnActive\(false\)/g) || []).length >= 2,
+  `${(script.match(/setTurnActive\(false\)/g) || []).length} 处`);
 
 console.log(`\n结果: ${pass} 通过 / ${fail} 失败`);
 process.exit(fail ? 1 : 0);
