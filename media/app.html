@@ -275,6 +275,13 @@
       <path d="M14 3.5V7a.5.5 0 0 0 .5.5H18"/>
     </g>
   </symbol>
+  <symbol id="ic-folder" viewBox="0 0 24 24">
+    <g fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"
+       stroke-linejoin="round">
+      <path d="M3.5 7.5A1.5 1.5 0 0 1 5 6h4l2 2.5h6.5A1.5 1.5 0 0 1 19 10v7.5a1.5 1.5 0 0
+        1-1.5 1.5H5a1.5 1.5 0 0 1-1.5-1.5z"/>
+    </g>
+  </symbol>
   <symbol id="ic-archive" viewBox="0 0 24 24">
     <g fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"
        stroke-linejoin="round">
@@ -324,6 +331,7 @@
         <div class="attmenu hide" id="attmenu">
           <button id="pickImg"><svg><use href="#ic-image"/></svg>图片</button>
           <button id="pickDoc"><svg><use href="#ic-file"/></svg>文件</button>
+          <button id="pickAny"><svg><use href="#ic-folder"/></svg>任意文件</button>
         </div>
       </div>
       <textarea id="input" rows="1" placeholder="发消息…"></textarea>
@@ -343,6 +351,13 @@
     -->
     <input type="file" id="doc" class="hide" multiple
       accept="text/*,application/*,.md,.log,.csv,.json,.yaml,.yml,.py,.js,.ts,.sh,.sql,.xml,.toml,.ipynb">
+    <!--
+      「任意文件」不限类型，是给上面那条走不通的浏览器留的退路。
+      实测：排除媒体类型时夸克直达文件管理器，而 Chrome / 飞书内置浏览器给不出；不限类型时
+      Chrome 能经系统面板的「更多」进文件管理，夸克却退回媒体面板。没有单一 accept 能同时
+      满足三家，所以两条路都留着，由用户选。
+    -->
+    <input type="file" id="any" class="hide" multiple>
   </footer>
 </div>
 <div id="sheet" class="hide">
@@ -1347,10 +1362,15 @@ el('pickDoc').onclick = () => {
   showAttMenu(false);
   el('doc').click();
 };
+el('pickAny').onclick = () => {
+  showAttMenu(false);
+  el('any').click();
+};
 // 点别处收起菜单
 document.addEventListener('click', () => showAttMenu(false));
 el('file').onchange = onPicked;
 el('doc').onchange = onPicked;
+el('any').onchange = onPicked;
 
 input.addEventListener('input', () => {
   input.style.height = 'auto';
