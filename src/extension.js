@@ -95,17 +95,25 @@ let lastStatusKey = '';
  */
 const pendingPermissions = new Map();
 /**
- * 权限请求记录的保留时长。
+ * 未回应的权限请求**永不过期** —— 行为与电脑端一致：有审批就一直等你，不会自己作废。
  *
- * 取 24 小时，不是拍的：翻了本机 183 次 tool_approval 的实际响应间隔，中位 9.5 秒，
- * 但有 10 次（5.5%）超过 30 分钟，最长 607 分钟（10.1 小时）—— 全部是 selected，
- * 也就是人确实隔了那么久才批，请求一直活着。
+ * 演进过程值得留着，因为这是同一个错误连犯两次：
+ *   第一版 30 分钟 TTL，过期就拒绝响应。实测 183 次工具授权里有 10 次（5.5%）超过
+ *   30 分钟才被响应、最长 607 分钟，而它们全部是正常批准的 —— 这个 TTL 会把合法的
+ *   慢响应判成「已过期」直接拒发。
+ *   第二版放宽到 24 小时。仍然是同一个毛病，只是把门槛抬高了：拿时钟去猜「请求还
+ *   活不活」，而这件事有确定性信号（interaction_resolved），根本不需要猜。
  *
- * 第一版这里写的是 30 分钟，那会把这 10 次合法的慢响应判成「已过期」并拒绝发出，
- * 等于用一个新的失败模式换掉旧的。TTL 的用途只有「给内存兜底」，不该承担
- * 「判断请求还活不活」——后者由下面的 markPermissionResolved 按真实结局来做。
+ * 现在时间只用来回收**已经有结局的**记录（下面这个常量），未回应的一律留着。
+ * 「请求是否还有效」全部交给 markPermissionResolved 按真实结局判断。
  */
-const PERMISSION_TTL_MS = 24 * 60 * 60 * 1000;
+const RESOLVED_KEEP_MS = 10 * 60 * 1000;
+/**
+ * 记录条数的硬上限，纯粹防异常情况下无上界增长。
+ * 正常量级：本机全部历史 36 个会话共 183 次审批，一条记录几百字节，扩展重启即清空。
+ * 也就是说这个上限在正常使用中永远不会碰到 —— 它只是个兜底，不参与任何正确性判断。
+ */
+const PERMISSION_MAX_RECORDS = 5000;
 /** 最近一次从 agent 响应里拿到的完整模型清单，见 MODELS_FILE */
 let modelOptions = [];
 /** 与上面同来源的默认模型，避免自己编一个默认值 */
@@ -722,16 +730,35 @@ function markPermissionResolved(toolCallId, outcome) {
   return true;
 }
 
-/** 丢掉过期的权限请求记录，并返回丢掉的条数 */
+/**
+ * 回收权限请求记录。
+ *
+ * 只回收**已经有结局的**记录，而且要等结局产生一段时间之后 —— 留这段时间是为了让
+ * 手机上那次点击还能拿到「已被处理 / 已被取消」这种准确说明，而不是掉进
+ * 「未知 toolCallId」的整批降级路径。
+ *
+ * 未回应的记录一律不动。它们代表「还在等你」，等多久都不该被清掉。
+ */
 function prunePendingPermissions(now = Date.now()) {
   let n = 0;
   for (const [id, rec] of pendingPermissions) {
-    if (now - (rec.at || 0) > PERMISSION_TTL_MS) {
+    if (rec.resolvedAt && now - rec.resolvedAt > RESOLVED_KEEP_MS) {
       pendingPermissions.delete(id);
       n++;
     }
   }
-  if (n) log(`[approve] 清掉 ${n} 条过期的权限请求记录`);
+  // 兜底：只有在异常情况下才可能触发。优先丢已有结局的，其次丢最老的。
+  if (pendingPermissions.size > PERMISSION_MAX_RECORDS) {
+    const victims = [...pendingPermissions.entries()]
+      .sort((a, b) => (a[1].resolvedAt ? 0 : 1) - (b[1].resolvedAt ? 0 : 1) || (a[1].at || 0) - (b[1].at || 0))
+      .slice(0, pendingPermissions.size - PERMISSION_MAX_RECORDS);
+    for (const [id] of victims) {
+      pendingPermissions.delete(id);
+      n++;
+    }
+    log(`[approve] 记录数超过 ${PERMISSION_MAX_RECORDS}，已回收最老的 ${victims.length} 条`);
+  }
+  if (n) log(`[approve] 回收了 ${n} 条已有结局的权限请求记录`);
   return n;
 }
 
@@ -745,11 +772,8 @@ async function respondPermission(toolCallId, approve) {
     log(`[approve] toolCallId=${toolCallId} ${how}，拒绝重复响应`);
     throw new Error(`这个请求${how}，你这次点击没有生效。`);
   }
-  if (rec && Date.now() - (rec.at || 0) > PERMISSION_TTL_MS) {
-    pendingPermissions.delete(toolCallId);
-    log(`[approve] toolCallId=${toolCallId} 超过 ${PERMISSION_TTL_MS / 3600000} 小时，拒绝响应`);
-    throw new Error('这个请求太久了（超过 24 小时），没有生效。回到会话里看看当前状态。');
-  }
+  // 刻意没有「太久了就拒绝」这一档：未回应的请求不过期，等多久都照发。
+  // 请求到底还活不活，由上面的 resolvedAt 按真实结局判断，不拿时钟猜。
   // 已经批过一次、正在等结局的，不要重复往同一个 requestId 上回响应
   if (rec && rec.respondedAt) {
     const waited = Date.now() - rec.respondedAt;
@@ -1218,6 +1242,8 @@ module.exports = {
     prunePendingPermissions,
     respondPermission,
     markPermissionResolved,
-    PERMISSION_TTL_MS,
+    onMuxInbound,
+    RESOLVED_KEEP_MS,
+    PERMISSION_MAX_RECORDS,
   },
 };

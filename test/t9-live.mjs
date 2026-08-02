@@ -78,11 +78,36 @@ const resolved = store.liveState(make('resolved', [
 ], 1));
 check('已回应的 pending → 不是 waiting', resolved !== 'waiting', `得到 ${resolved}`);
 
-// 7. 等待窗口之外（超过 30 分钟）-> idle
+// 7. 等确认不看时间 —— 这条断言此前是反的
+//
+// 原来写的是「45 分钟前的 pending → idle（窗口外）」，理由是超过 30 分钟的等待窗口。
+// 那个契约是错的，而且错在最要紧的场合：**agent 在等你审批时，文件本来就不动**。
+// 实测审批可以等 607 分钟，于是一个正等着你的会话在列表上显示成灰色，
+// 恰好把最需要被看见的状态藏起来了。现在等确认是确定性判定，与静置多久无关。
 const oldWait = store.liveState(make('oldwait', [
   { type: 'pending_interaction', interactionType: 'tool_approval', toolCallId: 'tc9' },
 ], 45));
-check('45 分钟前的 pending → idle（窗口外）', oldWait === 'idle', `得到 ${oldWait}`);
+check('45 分钟前的 pending → 仍然 waiting（等确认不看时间）',
+  oldWait === 'waiting', `得到 ${oldWait}`);
+
+const ancientWait = store.liveState(make('ancientwait', [
+  { type: 'pending_interaction', interactionType: 'tool_approval', toolCallId: 'tc9b' },
+], 60 * 24 * 30)); // 静置 30 天
+check('静置 30 天的未回应 pending → 仍然 waiting',
+  ancientWait === 'waiting', `得到 ${ancientWait}`);
+
+// 7b. 但字节窗口仍然生效：pending 之后 agent 又写了大量内容，说明它没在等这个 pending。
+// 实测真有这样一条历史记录：pending 之后又写了 1.28MB。这种悬挂记录不该显示成「正在等你」。
+const pushedOut = store.liveState(make('pushedout', [
+  { type: 'pending_interaction', interactionType: 'tool_approval', toolCallId: 'tc9c' },
+  // 用足量的后续内容把那条 pending 顶出 16KB 尾部窗口
+  ...Array.from({ length: 400 }, (_, i) => ({
+    type: 'assistant', content: 'x'.repeat(80), executionId: 'e-push', operationType: 'Say',
+  })),
+  { type: 'turn_end', stopReason: 'end_turn', executionId: 'e-push' },
+], 45));
+check('被后续内容顶出尾部窗口的 pending → 不是 waiting', pushedOut !== 'waiting',
+  `得到 ${pushedOut}`);
 
 // 8. 空文件 / 不存在
 check('0 字节文件 → idle', store.liveState(make('empty', [], 0)) === 'idle');

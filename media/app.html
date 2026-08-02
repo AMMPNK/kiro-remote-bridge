@@ -480,7 +480,9 @@ const esc = (s) => String(s == null ? '' : s)
 function liveOf(s) {
   if (s.live) return s.live;
   const age = Date.now() - (s.lastActiveAt || 0);
-  if (s.status === 'waiting_on_user' && age < 30 * 60 * 1000) return 'waiting';
+  // 等确认刻意不设时间窗：agent 在等你审批时文件本来就不动，用静置时长去判断它
+  // 等于专门把这个状态判错。后端的 liveState 同理。
+  if (s.status === 'waiting_on_user') return 'waiting';
   if (s.status === 'in_progress' && age < 3 * 60 * 1000) return 'running';
   return 'idle';
 }

@@ -38,8 +38,16 @@ const SESSIONS_ROOT = path.join(os.homedir(), '.kiro', 'sessions');
  * 这个值只影响读几次，不影响正确性。
  */
 const HISTORY_WINDOW_BYTES = 2 * 1024 * 1024;
+/**
+ * 「正在跑」的时间窗。这个窗口是必要的：会话被中断会永久停在 turn_start，
+ * 没有时间窗就会一直显示运行中。
+ */
 const RUNNING_WINDOW_MS = 3 * 60 * 1000;
-const WAITING_WINDOW_MS = 30 * 60 * 1000;
+/*
+ * 这里原来还有一个 WAITING_WINDOW_MS = 30 分钟，用来判「等确认」。已删除 ——
+ * 等审批时文件本来就不动，用静置时长去判断它，等于专门把这个状态判错。
+ * 现在「等确认」只看 pending / resolved 是否成对，不看时间。
+ */
 /** 从文件尾部回读的字节数，够覆盖最近若干个事件 */
 const TAIL_PROBE_BYTES = 16 * 1024;
 
@@ -207,8 +215,22 @@ class SessionStore {
     if (size <= 0) return 'idle';
 
     const age = Date.now() - mtimeMs;
-    // 超出等待窗口就不可能是这两种活跃态，直接短路，省掉文件读取
-    if (age > WAITING_WINDOW_MS) return 'idle';
+    /*
+     * 这里原来有一句「文件静置超过 30 分钟就直接判 idle」的短路，为了省掉文件读取。
+     * 它错在最要紧的场合：**agent 在等你审批时，文件本来就不动**。实测审批可以等
+     * 607 分钟，于是一个正等着你的会话在列表上显示成灰色 idle —— 恰好把最需要被看见
+     * 的状态藏了起来。
+     *
+     * 现在不看时间，只看内容。「等确认」由 pending_interaction 与 interaction_resolved
+     * 是否成对来判定，这是确定性的，不需要猜。
+     *
+     * 保留的是**字节窗口**（只读尾部 TAIL_PROBE_BYTES）而不是时间窗口，这个区分是关键：
+     * 真在等审批时 pending 就是最后写入的事件，一定落在尾部窗口里；而如果 agent 没等它、
+     * 继续跑了（实测有一条这样的历史记录，pending 之后又写了 1.28MB），那个 pending
+     * 会被推到窗口外，不会被误判成「正在等你」。
+     *
+     * 代价实测可忽略：35 个会话全部真读 16KB 尾部合计 3.16ms。
+     */
 
     const readLen = Math.min(size, TAIL_PROBE_BYTES);
     let text = '';

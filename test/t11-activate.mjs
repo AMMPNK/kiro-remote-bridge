@@ -150,7 +150,7 @@ check('autoStart 打开时注册 4 秒启动任务',
 // 手机上却显示已批准。所以要断言的是「过期的请求必须显式失败」，而不只是「表会变小」。
 {
   const { pendingPermissions, prunePendingPermissions, respondPermission,
-    markPermissionResolved, PERMISSION_TTL_MS } = ext.__test;
+    markPermissionResolved, RESOLVED_KEEP_MS } = ext.__test;
   pendingPermissions.clear();
 
   const responded = [];
@@ -167,11 +167,36 @@ check('autoStart 打开时注册 4 秒启动任务',
     });
   };
 
+  // 未回应的请求永不过期 —— 行为要和电脑端一致：有审批就一直等，不自己作废。
+  // 这是本项目在同一个地方犯过两次的错（30 分钟、然后 24 小时），所以正反都断言。
+  mk('waiting-forever', 400 * 24 * 60 * 60 * 1000); // 挂了 400 天
+  check('未回应的请求再老也不会被回收',
+    prunePendingPermissions() === 0 && pendingPermissions.has('waiting-forever'),
+    `剩 ${[...pendingPermissions.keys()].join(',')}`);
+  responded.length = 0;
+  const oldRes = await respondPermission('waiting-forever', true);
+  check('挂了 400 天的请求照样能批出去',
+    oldRes && oldRes.via === 'mux' && responded.length === 1 &&
+    responded[0].payload.outcome.optionId === 'opt-allow',
+    JSON.stringify({ oldRes, n: responded.length }));
+  pendingPermissions.clear();
+
+  // 已有结局的记录才回收，而且要等一段时间，让手机那次点击还能拿到准确说明
+  mk('done-recent', 1000);
+  markPermissionResolved('done-recent', 'selected');
+  mk('done-long-ago', 1000);
+  markPermissionResolved('done-long-ago', 'selected');
+  pendingPermissions.get('done-long-ago').resolvedAt = Date.now() - RESOLVED_KEEP_MS - 60000;
+  mk('still-waiting', 1000);
+  check('只回收已有结局且过了保留期的记录',
+    prunePendingPermissions() === 1 &&
+    pendingPermissions.has('done-recent') &&
+    !pendingPermissions.has('done-long-ago') &&
+    pendingPermissions.has('still-waiting'),
+    `剩 ${[...pendingPermissions.keys()].sort().join(',')}`);
+  pendingPermissions.clear();
+
   mk('fresh', 1000);
-  mk('old', PERMISSION_TTL_MS + 60000);
-  check('过期记录会被清掉，新鲜的留下',
-    prunePendingPermissions() === 1 && pendingPermissions.has('fresh') &&
-    !pendingPermissions.has('old'), `剩 ${[...pendingPermissions.keys()].join(',')}`);
 
   // 新鲜的照常走 mux 路径
   responded.length = 0;
@@ -213,26 +238,16 @@ check('autoStart 打开时注册 4 秒启动任务',
   check('在别处被取消的请求给出准确原因',
     !!canc && /已被取消/.test(canc.message), canc ? canc.message : '没有抛错');
 
-  // TTL 只用来给内存兜底，取值必须足够长
-  // 实测 183 次 tool_approval 里有 10 次超过 30 分钟才被响应，最长 607 分钟，全部是
-  // 正常批准。30 分钟的 TTL 会把这些合法慢响应砍掉，所以这里硬校验下界。
-  check('TTL 不短于 12 小时（覆盖实测最长 607 分钟的慢响应）',
-    PERMISSION_TTL_MS >= 12 * 60 * 60 * 1000,
-    `${(PERMISSION_TTL_MS / 3600000).toFixed(0)} 小时`);
+  /*
+   * 这里本来还加了一条「源码里不该出现『太久了就拒绝』」的文本检查，已删除：
+   * 它匹配裸字符串，结果命中了那句说明「该分支已被刻意删除」的注释，报了个假故障 ——
+   * 同一个毛病本项目已经犯过三次（ENDPOINTS_FILE、这次）。
+   * 而且上面「挂了 400 天的请求照样能批出去」是行为断言，严格强于文本检查，
+   * 有它就不需要那条。
+   */
 
-  // 超过 TTL 的必须抛错，且绝不能对 agent 回响应
-  mk('stale', PERMISSION_TTL_MS + 60000);
-  responded.length = 0;
-  let threw = null;
-  try {
-    await respondPermission('stale', true);
-  } catch (e) { threw = e; }
-  check('超过 TTL 的请求显式失败', !!threw && /太久了/.test(threw.message),
-    threw ? threw.message : '没有抛错');
-  check('过期请求不对 agent 回任何响应', responded.length === 0, JSON.stringify(responded));
-  check('过期请求的记录被清掉', !pendingPermissions.has('stale'));
-  // 关键：不能退回整批命令。runOrAcceptAll 的作用范围远大于用户以为的那一个工具调用
-  check('过期请求不会退化成整批批准',
+  // 关键：任何失败都不能退回整批命令。runOrAcceptAll 的作用范围远大于单条工具调用
+  check('全过程没有退化成整批批准',
     !executed.includes('kiroAgent.execution.runOrAcceptAll'), executed.join(','));
   pendingPermissions.clear();
 }
