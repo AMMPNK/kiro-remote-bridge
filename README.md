@@ -21,6 +21,7 @@
 - **可以传文件** —— 图片、文本、二进制都能带上；图片在手机侧先缩边，附件预算按服务端握手时报来的真实帧上限算
 - **能从手机停掉跑偏的回合** —— 正在跑时发送键换成停止键，走 `session/cancel`
 - **扫码即用** —— 局域网内扫二维码打开，带 token 鉴权
+- **能在手机上批准工具调用** —— 四个选项（Allow / Always allow / Deny / Always deny）逐个显示，点哪个就提交哪个；实机验证通过
 - **等审批不会自己作废** —— 有审批就一直等你，行为与电脑端一致；等确认的会话在列表上是琥珀色「待确认」并排到最前
 - **一致性门禁** —— 251 个测试，含审批链路端到端验证与 UI 一致性检查（DOM id / CSS class / 前后端消息类型双向对齐 / 解析器 kind 与渲染分支对齐）
 
@@ -96,36 +97,41 @@ node scripts/package.js
 
 ## 已知限制
 
-**远程批准的根本原因已定位并修复（0.7.0）。** 此前所有版本都在用错的提交机制：bridge 回 JSON-RPC 应答，而 Kiro 的 mux 给每个客户端标了 role，**observer 的 permission 应答会被直接丢弃**（产物里的日志原文：`discarded observer permission response ... (waiting for _kiro/permission/respond)`），只有 `primary`（拥有会话的桌面面板）的应答才转发给 agent。bridge 是 observer。
+**远程批准工具调用已经可用（0.7.0 起，实机验证通过）。** 这一条从项目第一版起一直写着「不可用」，0.7.0 定位到根因并修好了。
 
-现在改走 `_kiro/permission/respond`，参数照 Kiro 自己的调用抄：`{ toolCallId, optionId, sessionId }`。
+手机上弹出授权框，四个选项（Allow / Always allow / Deny / Always deny）逐个显示，点哪个就把那个 `optionId` 原样提交。实机验证：点 `Always allow` → 4.9 秒后 `outcome=selected`、`selectedOption=always-accept`，工具正常执行并返回数据。
 
-下面这段是定位过程中的实测数据，留作参考。原文曾写「不生效，因为请求已在 agent 侧被自动取消（实测 8 次全部在 6–130ms 内）」—— 那个结论下得过早：
+<details>
+<summary>根因与定位过程（值得留着，因为前两轮都错了）</summary>
 
-| 结局 | 次数 | 响应间隔 |
+**根因**：此前所有版本都在用错的提交机制 —— bridge 回 JSON-RPC 应答，而 Kiro 的 mux 给每个客户端标了 role，**observer 的 permission 应答会被直接丢弃**。产物里的日志字符串就是答案：
+
+```
+discarded observer permission response ... (waiting for _kiro/permission/respond)
+```
+
+只有 `primary`（拥有会话的桌面面板）的应答才转发给 agent，而 bridge 是 observer。正确做法是调 `_kiro/permission/respond`，参数 `{ toolCallId, optionId, sessionId }`（形状照 Kiro 自己的两处调用抄）。
+
+**为什么错了两轮**：前两轮都在统计历史数据，而那 183 次审批**全是从电脑上批的** —— 「从手机批」这个动作在样本里出现过零次。拿一份不含目标现象的数据做了两轮精细统计，精细本身成了错的来源。第三轮直接读产物实现，二十分钟就找到了。
+
+**真正的破案钥匙是耗时，不是 outcome**。同一个会话里三种结局并列：
+
+| 耗时 | 结局 | 含义 |
 | --- | --- | --- |
-| `selected`（人批了） | 173 | 中位 9.5 秒，p90 463 秒，最长 **607 分钟** |
-| `cancelled`（被自动取消） | 10 | 6–130 毫秒 |
+| 0.0s | `cancelled` | 无 handler，直接返回默认值 |
+| 305.2s | `cancelled` | 有 handler 在等，但收不到我们的响应 → 超时（产物里 `300 * 1e3`） |
+| 4.9s | `selected` | 修复后，手机批准落地 |
 
-被瞬间取消的只占 **5.5%**，其余 173 次请求一直活着等人响应 —— 所以「请求已经死了」不是普遍情况。当初那 8 个样本恰好都落在被取消的那一类里。
+前两者的 `outcome` 字段一模一样，只有耗时能区分，而两者的修法完全不同。
 
-而两种 `cancelled` 的耗时差异恰好指向了两种不同的根因：**14ms** 是「没有 handler，直接返回默认值」，**305 秒** 是「有 handler 在等，但它收不到我们的响应，最后超时」（305 秒正是产物里 `300 * 1e3` 那个超时）。后者才是真正要修的问题。
+**为什么 30 条测试全绿却没抓到**：它们钉的是旧契约（应答形状符合 ACP 规范、requestId 正确）。那个形状完全正确，只是送错了通道 —— 而假的 mux connection 对任何应答都返回成功，所以这个验证在原理上就不可能发现「mux 会按 role 丢弃它」。
 
-但也**不能**因此说远程批准可用：那 173 次都是从电脑上批的，手机发出的响应到底能不能落地，仍然没有任何直接证据。桥现在会把这件事记进日志 —— 手机批准之后，一旦等到该请求的真实结局，就会打印
+</details>
 
-```
-[approve] ★ 远程批准结果 toolCallId=… 手机请求=allow 实际结局=selected 间隔=…ms → 落地了
-```
-
-想确认能不能用，就从手机批一次，然后看 `Kiro Bridge: 打开日志` 里有没有这一行、以及它说落地还是没落地。
-
-相关的三种失败会明确告诉你原因，而不是假装成功：请求已在别处被处理、已被取消、或超过 24 小时。
-
-影响：**不在 shell 白名单里的命令，在手机上能不能放行取决于上面这件事**。白名单内的命令不受影响（不产生审批交互，直接执行）。想扩大可用范围，就往 `~/.kiro/settings/permissions.yaml` 里补命令。
+**`user_input` 类型的交互还不能在手机上回答。** 就是「Build a Feature / Fix a Bug」那种选择题，目前只渲染成待确认卡片、没有按钮。产物里有对应的 `_kiro/userInput/respond`（形状 `{ toolCallId, action, answer }`），通道是通的，只是还没接。
 
 **模型清单在首次使用时不完整。** `_kiro/config/template` 在结构上不返回模型列表（它把 `currentModelId` 传成 `undefined`，模型项整条被省略）。全量清单只出现在 `session/new` 与 `session/set_config_option` 的返回里，所以本项目见到一次就缓存下来。后果是：**第一次打开模型选择时只有你用过的模型**，从手机新建一次会话之后才完整。降级级别会写进日志（`[presets] ... 来源 agent|cache|history`）。
 
-**只有思考走实时流。** 正文仍靠文件 tail，约 1 秒一批。
 
 ## 安全说明
 

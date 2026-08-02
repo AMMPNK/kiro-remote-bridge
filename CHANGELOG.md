@@ -39,6 +39,24 @@
 现在断言改成「走 `_kiro/permission/respond` 且带齐三个参数」，并新增一条反向断言：
 **不再回 JSON-RPC 应答**。测试 266 → 271。
 
+### 实机验证通过
+
+手机上点 `Always allow` → **4.9 秒**后 `outcome=selected`、`selectedOption=always-accept`，
+工具 `status=completed` 并返回 7254 字节真实数据。
+
+`selectedOption` 是 `always-accept` 而不是 `accept`，说明 0.6.1 的四选项改动也生效了 ——
+用户点的那个选项原样传到了 agent，没有被后端的推断降级。
+
+同一个会话里三种结局并列，构成完整对照：
+
+| 耗时 | 结局 | 含义 |
+| --- | --- | --- |
+| 0.0s | `cancelled` | 无 handler，直接返回默认值 |
+| 305.2s | `cancelled` | 有 handler 在等，但收不到我们的响应 → 超时 |
+| **4.9s** | **`selected`** | **修复后，手机批准落地** |
+
+这也是「远程批准工具调用不可用」这条已知限制第一次被摘掉 —— 它从项目第一版起就在那里。
+
 ### 附带发现
 
 产物里还有 `_kiro/userInput/respond`（形状 `{ toolCallId, action, answer }`），
