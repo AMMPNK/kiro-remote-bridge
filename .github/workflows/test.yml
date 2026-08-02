@@ -25,7 +25,12 @@ jobs:
         with:
           node-version: '20'
 
-      # 没有运行时依赖，所以不需要 npm ci —— 测试全部只用 Node 标准库。
+      # 扩展本身零运行时依赖，但 t4 要拿自写的二维码编码器与 qrcode@1.5.4 逐掩码比对。
+      # 那个包是 test/ref 下的可选开发依赖（gitignored），不装的话 t4 会整个 SKIP ——
+      # 而二维码是扫码接入的核心，16 条断言在 CI 上等于不存在。
+      - name: 装参考实现（供 t4 交叉验证）
+        run: npm install --prefix test/ref --no-audit --no-fund
+
       # 只跑一次并把输出留下来给下一步复核，避免同一套测试跑两遍。
       - name: 跑全量测试
         run: node test/run-all.mjs | tee /tmp/testout.txt
@@ -36,19 +41,38 @@ jobs:
       #
       # 全部用 if 写，不用 `grep && { }`：后者在 grep 未命中时整个 AND 链返回 1，
       # 而 run 是在 -e 下执行的，会把「检查通过」当成步骤失败。
+      # 这一步查三件事，缺任何一件都会让「少跑了几十条却显示绿色」溜过去：
+      #   1. 该 SKIP 的确实 SKIP（t1-store 依赖本机真实会话数据，CI 上必然跳过）
+      #   2. **不该 SKIP 的没有 SKIP** —— 用白名单，清单外的跳过一律失败。
+      #      第一版只查了第 1 件，结果 t4-qr 因为缺 qrcode 静默跳过、少跑 16 条断言，
+      #      而流水线照样绿。表现只有汇总里一行 [SKIP]，看起来完全像正常行为。
+      #   3. 没有 EMPTY（零断言的文件）
       - name: 复核跳过与空断言
         run: |
-          if ! grep -q '\[SKIP\] t1-store' /tmp/testout.txt; then
-            echo "预期 t1-store 在 CI 上走 SKIP 分支（这里没有 ~/.kiro/sessions），实际不是："
-            grep 't1-store' /tmp/testout.txt || true
+          ALLOWED_SKIP='t1-store'
+
+          if ! grep -q "\[SKIP\] ${ALLOWED_SKIP}" /tmp/testout.txt; then
+            echo "预期 ${ALLOWED_SKIP} 在 CI 上走 SKIP 分支（这里没有 ~/.kiro/sessions），实际不是："
+            grep "${ALLOWED_SKIP}" /tmp/testout.txt || true
             exit 1
           fi
+
+          UNEXPECTED=$(grep '\[SKIP\]' /tmp/testout.txt | grep -v "${ALLOWED_SKIP}" || true)
+          if [ -n "${UNEXPECTED}" ]; then
+            echo "出现了未登记的 SKIP —— 这些断言在 CI 上根本没跑，拒绝通过："
+            echo "${UNEXPECTED}"
+            echo "要么补上它缺的依赖，要么把它加进 ALLOWED_SKIP 并写明理由。"
+            exit 1
+          fi
+
           if grep -q 'EMPTY' /tmp/testout.txt; then
             echo "有测试文件没有输出任何断言结果（EMPTY），拒绝通过："
             grep -n 'EMPTY' /tmp/testout.txt
             exit 1
           fi
-          echo "OK：t1-store 显式跳过，且没有 EMPTY 文件"
+
+          TOTAL=$(grep -oE '合计 [0-9]+ 通过' /tmp/testout.txt | grep -oE '[0-9]+')
+          echo "OK：只有 ${ALLOWED_SKIP} 跳过、没有 EMPTY，实跑 ${TOTAL} 条断言"
 
       - name: 打包（含白名单与必需项双向校验）
         run: node scripts/package.js
