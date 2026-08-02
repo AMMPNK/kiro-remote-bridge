@@ -135,6 +135,47 @@ for (const tag of ['div', 'header', 'footer', 'main', 'svg']) {
   check(`<${tag}> 标签配对`, open === close, `${open} 开 / ${close} 闭`);
 }
 
+// ---- 9b. sessionStore 产出的 kind 与前端 nodeFor 的对齐
+// 第 8 条检查的是「后端广播的消息类型」，这条检查的是「解析器产出的渲染事件种类」——
+// 两个不同的边界，之前只有前者有门禁。nodeFor 的 default 分支是 return ''，
+// 也就是不认识的 kind 会被静默丢掉，正是最容易长期没人发现的形态。
+const storeSrc = readFileSync(join(ROOT, 'src', 'sessionStore.js'), 'utf8');
+const producedKinds = new Set([...storeSrc.matchAll(/kind: '([a-zA-Z]+)'/g)].map((m) => m[1]));
+producedKinds.add('reasoning'); // 运行时算出来的，抓不到字面量
+const nodeForBody = script.slice(script.indexOf('function nodeFor'));
+const renderedKinds = new Set(
+  [...nodeForBody.slice(0, nodeForBody.indexOf('function bindTools')).matchAll(/case '([a-zA-Z]+)'/g)]
+    .map((m) => m[1])
+);
+/** 刻意不渲染的 kind，必须写明理由 */
+const NOT_RENDERED = new Map([
+  ['context', '附加的上下文文件清单，不是对话内容'],
+  ['usage', 'token 用量统计，手机上不展示'],
+  ['turnStart', '回合开始标记，只用于后端判活（liveState）'],
+  ['sessionEvent', '会话生命周期事件，手机上不展示'],
+]);
+const droppedSilently = [...producedKinds].filter(
+  (k) => !renderedKinds.has(k) && !NOT_RENDERED.has(k)
+);
+check('解析器产出的 kind 要么被渲染、要么登记了不渲染的理由',
+  droppedSilently.length === 0,
+  droppedSilently.length
+    ? `会被静默丢掉: ${droppedSilently.join(', ')}`
+    : `产出 ${producedKinds.size} 种，渲染 ${renderedKinds.size} 种，登记不渲染 ${NOT_RENDERED.size} 种`);
+// 反方向：登记表里不该有已经不存在的 kind
+const staleExempt = [...NOT_RENDERED.keys()].filter((k) => !producedKinds.has(k));
+check('不渲染登记表里没有已消失的 kind', staleExempt.length === 0, staleExempt.join(', '));
+
+// ---- 9c. 待确认选项的标签字段
+// 两类交互的字段名不一样：tool_approval 用 name，user_input 用 title。
+// 只读 title 会让所有工具授权卡片的选项显示成空的「 /  /  / 」——
+// 而那正是最需要看清有哪些选项的场合。实测数据里 703 个选项用 name、5 个用 title。
+check('选项标签同时认 name 与 title',
+  /o\.name \|\| o\.title|o\.title \|\| o\.name/.test(script),
+  '应有 optionLabels 之类同时取两个字段的实现');
+check('待确认卡片走 optionLabels 而不是直接取 title',
+  /case 'pending':[\s\S]{0,400}?optionLabels\(m\.options\)/.test(script));
+
 // ---- 10. 停止键的两个已知失效方向
 // 这几条是针对具体缺陷的回归闸门，不是泛化检查：写这个按钮时两个方向各踩了一次。
 check('停止键会发出 session:cancel',

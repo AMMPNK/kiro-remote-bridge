@@ -94,8 +94,18 @@ let lastStatusKey = '';
  * 「已批准」。后者比内存更值得修：它是一个假成功。
  */
 const pendingPermissions = new Map();
-/** 权限请求的保留时长。与 sessionStore 的 WAITING_WINDOW_MS 对齐，人可能离开手机一会儿 */
-const PERMISSION_TTL_MS = 30 * 60 * 1000;
+/**
+ * 权限请求记录的保留时长。
+ *
+ * 取 24 小时，不是拍的：翻了本机 183 次 tool_approval 的实际响应间隔，中位 9.5 秒，
+ * 但有 10 次（5.5%）超过 30 分钟，最长 607 分钟（10.1 小时）—— 全部是 selected，
+ * 也就是人确实隔了那么久才批，请求一直活着。
+ *
+ * 第一版这里写的是 30 分钟，那会把这 10 次合法的慢响应判成「已过期」并拒绝发出，
+ * 等于用一个新的失败模式换掉旧的。TTL 的用途只有「给内存兜底」，不该承担
+ * 「判断请求还活不活」——后者由下面的 markPermissionResolved 按真实结局来做。
+ */
+const PERMISSION_TTL_MS = 24 * 60 * 60 * 1000;
 /** 最近一次从 agent 响应里拿到的完整模型清单，见 MODELS_FILE */
 let modelOptions = [];
 /** 与上面同来源的默认模型，避免自己编一个默认值 */
@@ -678,6 +688,40 @@ async function sendToSession(sessionId, text, attachments) {
  * 细粒度：mux 送来过该 toolCallId 的 request_permission，就直接回它。
  * 粗粒度：否则用 runOrAcceptAll / rejectAll —— 注意这作用于当前活动会话的整批操作。
  */
+/**
+ * 标记某个权限请求已经有结局了（通常是人在电脑上批的，我们从文件 tail 里看到）。
+ *
+ * 这才是「这个请求还活不活」的权威判据。用时钟去猜是错的：实测有 5.5% 的审批
+ * 隔了半小时以上才被响应，最长 10 小时，而它们全都是正常批准的。
+ *
+ * 刻意标记而不是直接删除：删掉之后 respondPermission 会走「未知 toolCallId」那条
+ * 降级路径，对当前活动会话执行 runOrAcceptAll —— 作用范围远大于用户以为自己在批的
+ * 那一个工具调用。留着记录才能给出准确的失败原因。
+ */
+function markPermissionResolved(toolCallId, outcome) {
+  const rec = toolCallId && pendingPermissions.get(toolCallId);
+  if (!rec || rec.resolvedAt) return false;
+  rec.resolvedAt = Date.now();
+  rec.outcome = outcome || 'resolved';
+  if (rec.respondedAt) {
+    /*
+     * 手机批过之后才等到的结局 —— 这是「远程批准到底有没有落地」唯一的直接证据。
+     * 此前这件事在日志里查不到：桥只记录「已发出」，而发出之后发生了什么没人看。
+     * README 里那句「远程批准不生效」也只是从少数被瞬间取消的样本推出来的。
+     */
+    const ms = rec.resolvedAt - rec.respondedAt;
+    log(
+      `[approve] ★ 远程批准结果 toolCallId=${toolCallId} ` +
+        `手机请求=${rec.respondedApprove ? 'allow' : 'deny'} ` +
+        `实际结局=${rec.outcome} 间隔=${ms}ms ` +
+        `→ ${rec.outcome === 'selected' ? '落地了' : '没落地'}`
+    );
+  } else {
+    log(`[approve] toolCallId=${toolCallId} 已在别处有结局（${rec.outcome}），手机端再批不会生效`);
+  }
+  return true;
+}
+
 /** 丢掉过期的权限请求记录，并返回丢掉的条数 */
 function prunePendingPermissions(now = Date.now()) {
   let n = 0;
@@ -692,16 +736,28 @@ function prunePendingPermissions(now = Date.now()) {
 }
 
 async function respondPermission(toolCallId, approve) {
-  const stale = toolCallId && pendingPermissions.get(toolCallId);
-  if (stale && Date.now() - (stale.at || 0) > PERMISSION_TTL_MS) {
-    // 显式失败，不要退到整批命令：那会对当前活动会话执行 runOrAcceptAll，
-    // 作用范围远大于用户以为自己在批准的那一个工具调用。
+  const rec = toolCallId && pendingPermissions.get(toolCallId);
+  // 已经有结局的，如实说清楚。不要退到整批命令路径 —— 那会对当前活动会话执行
+  // runOrAcceptAll，作用范围远大于用户以为自己在批准的那一个工具调用。
+  if (rec && rec.resolvedAt) {
     pendingPermissions.delete(toolCallId);
-    log(`[approve] toolCallId=${toolCallId} 已过期，拒绝响应`);
-    throw new Error('这个请求已经过期了，没有生效。回到会话里看看当前状态。');
+    const how = rec.outcome === 'cancelled' ? '已被取消' : `已被处理（${rec.outcome}）`;
+    log(`[approve] toolCallId=${toolCallId} ${how}，拒绝重复响应`);
+    throw new Error(`这个请求${how}，你这次点击没有生效。`);
   }
-  if (toolCallId && pendingPermissions.has(toolCallId)) {
-    const { connection, requestId, optionIds } = pendingPermissions.get(toolCallId);
+  if (rec && Date.now() - (rec.at || 0) > PERMISSION_TTL_MS) {
+    pendingPermissions.delete(toolCallId);
+    log(`[approve] toolCallId=${toolCallId} 超过 ${PERMISSION_TTL_MS / 3600000} 小时，拒绝响应`);
+    throw new Error('这个请求太久了（超过 24 小时），没有生效。回到会话里看看当前状态。');
+  }
+  // 已经批过一次、正在等结局的，不要重复往同一个 requestId 上回响应
+  if (rec && rec.respondedAt) {
+    const waited = Date.now() - rec.respondedAt;
+    log(`[approve] toolCallId=${toolCallId} ${waited}ms 前已响应过，忽略重复点击`);
+    throw new Error('这个请求刚刚已经批过了，正在等 agent 的结果。');
+  }
+  if (rec) {
+    const { connection, requestId, optionIds } = rec;
     const optionId = approve ? optionIds.allow : optionIds.deny;
     // 放行必须带上具体 optionId：缺 optionId 的 selected 在协议上是无效响应，agent 侧会
     // 当成取消处理，而手机端却会看到「已回应」。宁可显式失败，也不要制造这种假成功。
@@ -714,9 +770,13 @@ async function respondPermission(toolCallId, approve) {
     connection.respond(requestId, {
       outcome: optionId ? { outcome: 'selected', optionId } : { outcome: 'cancelled' },
     });
-    pendingPermissions.delete(toolCallId);
+    // 刻意不删记录：留着才能在结局到达时对上账，把「远程批准有没有落地」写进日志。
+    // 由 prunePendingPermissions 按 TTL 回收。
+    rec.respondedAt = Date.now();
+    rec.respondedApprove = !!approve;
     log(
-      `[approve] via mux toolCallId=${toolCallId} approve=${approve} optionId=${optionId || '-'}`
+      `[approve] via mux toolCallId=${toolCallId} approve=${approve} optionId=${optionId || '-'}` +
+        '（已发出，等结局对账）'
     );
     return { via: 'mux', granularity: 'single' };
   }
@@ -808,6 +868,11 @@ function startPolling() {
       try {
         const d = store.tail(sessionId);
         if (!d.messages || !d.messages.length) continue;
+        // 文件里出现 interaction_resolved 就说明这个请求已经有结局了（通常是人在电脑上
+        // 批的）。这是判断「请求还活不活」的权威信号，比拿时钟去猜准。
+        for (const m of d.messages) {
+          if (m.kind === 'resolved') markPermissionResolved(m.toolCallId, m.outcome);
+        }
         // 只发给正在看这个会话的连接
         relay.broadcastTo((c) => c.watchedSessionId === sessionId, {
           type: d.reset ? 'history' : 'delta',
@@ -1148,5 +1213,11 @@ module.exports = {
    * 暴露出来是因为权限记账的失效形态是「对死掉的 requestId 回响应，手机上显示已批准」——
    * 一个假成功，静态检查看不出来，只能靠真的走一遍。
    */
-  __test: { pendingPermissions, prunePendingPermissions, respondPermission, PERMISSION_TTL_MS },
+  __test: {
+    pendingPermissions,
+    prunePendingPermissions,
+    respondPermission,
+    markPermissionResolved,
+    PERMISSION_TTL_MS,
+  },
 };

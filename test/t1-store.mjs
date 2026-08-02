@@ -9,6 +9,7 @@
 import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
+import { readFileSync } from 'node:fs';
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
 const require = createRequire(join(ROOT, 'package.json'));
 const { SessionStore } = require('./src/sessionStore.js');
@@ -78,8 +79,20 @@ check('截断标记与消息数自洽',
   h.truncated ? h.messages.length === 400 : h.messages.length <= 400,
   `truncated=${h.truncated} n=${h.messages.length}`);
 
-const KNOWN_KINDS = new Set(['message', 'tool', 'toolResult', 'context', 'reasoning',
-  'pending', 'resolved', 'turnEnd', 'error', 'tombstone', 'subAgent']);
+/*
+ * 已知 kind 的清单从 sessionStore 源码里提取，不手写。
+ *
+ * 第一版是手写的，而清单是照「当时恰好最新的那个会话」的实际取值列的 —— 换一个会话
+ * 就冒出 usage / sessionEvent / turnStart 三个漏项。样本不是清单的来源，产出方才是。
+ * 这与 t8 不把后端广播类型写死成数组是同一条纪律。
+ */
+const storeSrc = readFileSync(join(ROOT, 'src', 'sessionStore.js'), 'utf8');
+const KNOWN_KINDS = new Set(
+  [...storeSrc.matchAll(/kind: '([a-zA-Z]+)'/g)].map((m) => m[1])
+);
+// reasoning 是运行时算出来的（isReasoning ? 'reasoning' : 'message'），抓不到字面量
+KNOWN_KINDS.add('reasoning');
+check('能从源码提取出 kind 清单', KNOWN_KINDS.size >= 10, `${KNOWN_KINDS.size} 种`);
 const badKinds = [...new Set(h.messages.map((m) => m.kind))].filter((k) => !KNOWN_KINDS.has(k));
 check('渲染事件的 kind 都在已知取值内', badKinds.length === 0,
   badKinds.length ? `未知: ${badKinds.join(',')}` : `${new Set(h.messages.map((m) => m.kind)).size} 种`);

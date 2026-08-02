@@ -946,6 +946,20 @@ function dropStreamPlaceholders() {
   for (const b of mainEl.querySelectorAll('[data-stream]')) b.remove();
 }
 
+/**
+ * 选项的显示标签。两类交互的字段名不一样，实测：
+ *   tool_approval  {optionId, name, kind}        —— 工具授权，没有 title
+ *   user_input     {title, description, ...}     —— 让你选方向的提问
+ * 原来只读 title，于是所有工具授权卡片的选项都显示成空的「 /  /  / 」，
+ * 而那正是最需要看清「有哪些选项」的场合。
+ */
+function optionLabels(options) {
+  return (options || [])
+    .map((o) => (o && (o.name || o.title)) || '')
+    .filter(Boolean)
+    .join(' / ');
+}
+
 /** 用户消息的附件提示：只看文字分不出图到底有没有传上去 */
 function attNote(m) {
   const n = (m.images || 0) + (m.documents || 0);
@@ -985,7 +999,7 @@ function nodeFor(m) {
       return `<div class="tool"><div class="hd"><span class="caret">▶</span>
         <span class="nm">⏸ 待确认</span>
         <span class="ex">${esc(m.question || '')}</span></div>
-        <div class="bd">${esc((m.options || []).map((o) => o.title).join(' / '))}</div></div>`;
+        <div class="bd">${esc(optionLabels(m.options))}</div></div>`;
     case 'resolved':
       return `<div class="sys">已确认：${esc(m.selectedOption || m.outcome)}</div>`;
     case 'turnEnd':

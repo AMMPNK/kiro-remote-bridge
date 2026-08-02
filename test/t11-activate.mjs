@@ -149,8 +149,8 @@ check('autoStart 打开时注册 4 秒启动任务',
 // 失效形态是「假成功」：agent 早已取消该请求，bridge 仍对死掉的 requestId 回响应，
 // 手机上却显示已批准。所以要断言的是「过期的请求必须显式失败」，而不只是「表会变小」。
 {
-  const { pendingPermissions, prunePendingPermissions, respondPermission, PERMISSION_TTL_MS } =
-    ext.__test;
+  const { pendingPermissions, prunePendingPermissions, respondPermission,
+    markPermissionResolved, PERMISSION_TTL_MS } = ext.__test;
   pendingPermissions.clear();
 
   const responded = [];
@@ -180,16 +180,54 @@ check('autoStart 打开时注册 4 秒启动任务',
     okRes && okRes.via === 'mux' && okRes.granularity === 'single' &&
     responded.length === 1 && responded[0].payload.outcome.optionId === 'opt-allow',
     JSON.stringify({ okRes, responded }));
-  check('批准后记录被移除', !pendingPermissions.has('fresh'));
 
-  // 过期的必须抛错，且绝不能对 agent 回响应
+  // 批准后刻意保留记录，用来在结局到达时对账「远程批准有没有落地」
+  const after = pendingPermissions.get('fresh');
+  check('批准后记录保留，并记下响应时刻',
+    !!after && typeof after.respondedAt === 'number' && after.respondedApprove === true,
+    JSON.stringify(after && { respondedAt: !!after.respondedAt, approve: after.respondedApprove }));
+
+  // 重复点击不能再往同一个 requestId 上回一次
+  responded.length = 0;
+  let dup = null;
+  try { await respondPermission('fresh', true); } catch (e) { dup = e; }
+  check('重复点击被拒绝且不重复响应',
+    !!dup && /已经批过/.test(dup.message) && responded.length === 0,
+    dup ? dup.message : '没有抛错');
+
+  // 结局到达时要能对上账（这是「远程批准是否落地」唯一的直接证据）
+  check('结局到达时标记成功', markPermissionResolved('fresh', 'selected') === true);
+  check('同一结局不会被标记两次', markPermissionResolved('fresh', 'selected') === false);
+  responded.length = 0;
+  let done = null;
+  try { await respondPermission('fresh', true); } catch (e) { done = e; }
+  check('已有结局的请求再点会说明真实结局',
+    !!done && /已被处理/.test(done.message) && responded.length === 0,
+    done ? done.message : '没有抛错');
+
+  // 在别处被取消的，要说「已被取消」而不是含糊的失败
+  mk('cancelled-one', 1000);
+  markPermissionResolved('cancelled-one', 'cancelled');
+  let canc = null;
+  try { await respondPermission('cancelled-one', true); } catch (e) { canc = e; }
+  check('在别处被取消的请求给出准确原因',
+    !!canc && /已被取消/.test(canc.message), canc ? canc.message : '没有抛错');
+
+  // TTL 只用来给内存兜底，取值必须足够长
+  // 实测 183 次 tool_approval 里有 10 次超过 30 分钟才被响应，最长 607 分钟，全部是
+  // 正常批准。30 分钟的 TTL 会把这些合法慢响应砍掉，所以这里硬校验下界。
+  check('TTL 不短于 12 小时（覆盖实测最长 607 分钟的慢响应）',
+    PERMISSION_TTL_MS >= 12 * 60 * 60 * 1000,
+    `${(PERMISSION_TTL_MS / 3600000).toFixed(0)} 小时`);
+
+  // 超过 TTL 的必须抛错，且绝不能对 agent 回响应
   mk('stale', PERMISSION_TTL_MS + 60000);
   responded.length = 0;
   let threw = null;
   try {
     await respondPermission('stale', true);
   } catch (e) { threw = e; }
-  check('过期请求显式失败', !!threw && /过期/.test(threw.message),
+  check('超过 TTL 的请求显式失败', !!threw && /太久了/.test(threw.message),
     threw ? threw.message : '没有抛错');
   check('过期请求不对 agent 回任何响应', responded.length === 0, JSON.stringify(responded));
   check('过期请求的记录被清掉', !pendingPermissions.has('stale'));
