@@ -4,6 +4,47 @@
 
 > 0.1.2 及更早的版本在本文件建立之前，未逐条记录。
 
+## [0.7.0]
+
+**远程审批的根本原因找到了，改用正确的提交通道。** 此前所有版本都在用错的机制。
+
+### 修复
+
+- **权限响应改走 `_kiro/permission/respond`，不再回 JSON-RPC 应答。**
+
+  根因在 Kiro 产物的 `MultiplexStream` 里：mux 给每个客户端标了 role，
+  **observer 的 permission 应答会被直接丢弃**，日志字符串原文就是
+  `discarded observer permission response ... (waiting for _kiro/permission/respond)`；
+  只有 `primary`（拥有会话的桌面面板）的 JSON-RPC 应答才会转发给 agent。
+  bridge 是 observer，所以此前 `connection.respond(requestId, …)` 全部被静默丢掉。
+
+  实测后果与之完全吻合：手机点「允许」→ 电脑上的框继续挂着 → **305 秒**后以
+  `cancelled` 收场、`selectedOption` 为空。而 305 秒正是产物里 `300 * 1e3` 那个超时。
+
+  参数形状照 Kiro 自己的两处调用抄（`resolve-permission-request.ts` 与
+  `supervised-mode.ts`）：`{ toolCallId, optionId, sessionId }`。
+  为此在权限记账里补存了 `sessionId`（此前没存，因为旧机制不需要它）。
+
+- 提交失败（agent 拒绝 / 超时）时如实抛错并清掉 `respondedAt`，让用户可以重试 ——
+  绝不能让手机端以为批准成功了，那正是这个 bug 此前的形态。
+- 缺 `sessionId` 时显式失败，而不是发一个不完整的请求。
+
+### 为什么之前的测试没抓到
+
+`t12-approval` 的 30 条断言全部通过，实机却无效 —— 因为它们钉的是**旧契约**：
+「回一条 JSON-RPC respond，带对的 requestId，payload 形状符合 ACP 规范」。
+那个形状完全正确，只是**送错了通道**。假的 mux connection 总是接受任何 respond，
+所以这个验证在原理上就不可能发现「mux 会按 role 丢弃它」。
+
+现在断言改成「走 `_kiro/permission/respond` 且带齐三个参数」，并新增一条反向断言：
+**不再回 JSON-RPC 应答**。测试 266 → 271。
+
+### 附带发现
+
+产物里还有 `_kiro/userInput/respond`（形状 `{ toolCallId, action, answer }`），
+对应 `user_input` 类型的交互 —— 就是「Build a Feature / Fix a Bug」那种选择题。
+手机端目前只把它渲染成待确认卡片、不能回答。这条路现在是通的，但本版没做。
+
 ## [0.6.1]
 
 一次实机测试的直接产物。手机上弹出了授权框、点了「允许」、toast 说已发出，

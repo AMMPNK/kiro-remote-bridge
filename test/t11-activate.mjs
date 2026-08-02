@@ -157,12 +157,23 @@ check('autoStart 打开时注册 4 秒启动任务',
   const fakeConn = {
     respond: (id, payload) => responded.push({ id, payload }),
     respondError: (id, code, msg) => responded.push({ id, code, msg }),
+    // 真正的提交通道：bridge 是 mux 的 observer，回 JSON-RPC 应答会被丢弃，
+    // 必须调 _kiro/permission/respond。详见 t12-approval。
+    respondPermission: async (sessionId, toolCallId, optionId) => {
+      responded.push({ kind: 'extMethod', sessionId, toolCallId, optionId });
+      return {};
+    },
   };
   const mk = (id, ageMs) => {
     pendingPermissions.set(id, {
       connection: fakeConn,
       requestId: 'rpc-' + id,
+      sessionId: 'sess-t11',
       at: Date.now() - ageMs,
+      options: [
+        { optionId: 'opt-allow', name: 'Allow', kind: 'allow_once' },
+        { optionId: 'opt-deny', name: 'Deny', kind: 'reject_once' },
+      ],
       optionIds: { allow: 'opt-allow', deny: 'opt-deny' },
     });
   };
@@ -177,7 +188,7 @@ check('autoStart 打开时注册 4 秒启动任务',
   const oldRes = await respondPermission('waiting-forever', true);
   check('挂了 400 天的请求照样能批出去',
     oldRes && oldRes.via === 'mux' && responded.length === 1 &&
-    responded[0].payload.outcome.optionId === 'opt-allow',
+    responded[0].optionId === 'opt-allow',
     JSON.stringify({ oldRes, n: responded.length }));
   pendingPermissions.clear();
 
@@ -203,7 +214,7 @@ check('autoStart 打开时注册 4 秒启动任务',
   const okRes = await respondPermission('fresh', true);
   check('新鲜请求走 mux 单条批准',
     okRes && okRes.via === 'mux' && okRes.granularity === 'single' &&
-    responded.length === 1 && responded[0].payload.outcome.optionId === 'opt-allow',
+    responded.length === 1 && responded[0].optionId === 'opt-allow',
     JSON.stringify({ okRes, responded }));
 
   // 批准后刻意保留记录，用来在结局到达时对账「远程批准有没有落地」

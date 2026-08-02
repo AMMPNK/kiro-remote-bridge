@@ -821,21 +821,39 @@ async function respondPermission(toolCallId, approve, wantOptionId = null) {
       log(`[approve] 放行失败：选项里找不到 allow toolCallId=${toolCallId}`);
       throw new Error('这次请求没有可识别的「允许」选项，未放行（已如实回错误）');
     }
-    connection.respond(requestId, {
-      outcome: optionId ? { outcome: 'selected', optionId } : { outcome: 'cancelled' },
-    });
-    // 刻意不删记录：留着才能在结局到达时对上账，把「远程批准有没有落地」写进日志。
-    // 由 prunePendingPermissions 按 TTL 回收。
+    /*
+     * 走 _kiro/permission/respond，不再回 JSON-RPC 应答。
+     *
+     * 依据是 Kiro 产物里 MultiplexStream 的分发逻辑：mux 给每个客户端标了 role，
+     * observer 的 permission 应答会被直接丢弃（日志原文
+     * "discarded observer permission response ... (waiting for _kiro/permission/respond)"），
+     * 只有 primary（拥有会话的桌面面板）的应答才转发给 agent。bridge 是 observer，
+     * 所以此前 connection.respond(requestId, …) 全部被静默丢掉 —— 表现就是手机点了
+     * 「允许」、电脑上的框继续挂着，直到 5 分钟超时后以 cancelled 收场。
+     */
+    const sid = rec.sessionId;
+    if (!sid) {
+      log(`[approve] toolCallId=${toolCallId} 缺 sessionId，无法调用 _kiro/permission/respond`);
+      throw new Error('这次请求缺少会话标识，没法提交（请在手机上重新打开该会话再试）。');
+    }
     rec.respondedAt = Date.now();
     rec.respondedApprove = !!approve;
     rec.respondedOptionId = optionId || null;
-    // 把发出去的原始形状也记进日志：远程批准不生效时，第一件要核对的就是这个
     log(
-      `[approve] via mux toolCallId=${toolCallId} requestId=${requestId} ` +
-        `optionId=${optionId || '-'}${wantOptionId ? '（手机指定）' : '（按 approve 推断）'} ` +
-        `payload=${JSON.stringify({ outcome: { outcome: 'selected', optionId } })}` +
-        '（已发出，等结局对账）'
+      `[approve] 提交 _kiro/permission/respond sessionId=${sid} toolCallId=${toolCallId} ` +
+        `optionId=${optionId}${wantOptionId ? '（手机指定）' : '（按 approve 推断）'}`
     );
+    try {
+      await connection.respondPermission(sid, toolCallId, optionId);
+      log(`[approve] ★ _kiro/permission/respond 已被接受 toolCallId=${toolCallId}`);
+    } catch (err) {
+      // 失败要如实说，不能让手机端以为批准了
+      rec.respondedAt = 0;
+      const msg = String(err && err.message ? err.message : err);
+      log(`[approve] ★ _kiro/permission/respond 失败 toolCallId=${toolCallId}: ${msg}`);
+      throw new Error(`提交失败：${msg}`);
+    }
+    // 刻意不删记录：留着才能在结局到达时对上账
     return { via: 'mux', granularity: 'single', optionId: optionId || null };
   }
   const cmd = approve ? 'kiroAgent.execution.runOrAcceptAll' : 'kiroAgent.execution.rejectAll';
@@ -864,6 +882,8 @@ function onMuxInbound(m) {
     pendingPermissions.set(toolCallId, {
       connection,
       requestId: id,
+      // sessionId 是 _kiro/permission/respond 的必要参数，必须存下来
+      sessionId: (params && params.sessionId) || null,
       at: Date.now(),
       // 原样存下全部选项：手机端要把它们逐个显示成按钮，并回传用户点的那个 optionId。
       // 只存 allow/deny 两个推断结果是不够的 —— 四个选项里 allow_once 与 allow_always

@@ -66,7 +66,18 @@ let sent = [];
 const fakeConn = {
   respond: (id, payload) => sent.push({ kind: 'respond', id, payload }),
   respondError: (id, code, message) => sent.push({ kind: 'error', id, code, message }),
+  // 正确的提交通道。bridge 是 mux 的 observer 角色，回 JSON-RPC 应答会被丢弃，
+  // 必须调 _kiro/permission/respond。
+  respondPermission: async (sessionId, toolCallId, optionId) => {
+    if (failNextRespond) {
+      failNextRespond = false;
+      throw new Error('agent rejected');
+    }
+    sent.push({ kind: 'extMethod', sessionId, toolCallId, optionId });
+    return {};
+  },
 };
+let failNextRespond = false;
 
 /** 照真实数据的形状造一个 tool_approval 权限请求 */
 const REAL_OPTIONS = [
@@ -109,13 +120,28 @@ sent = [];
 const r1 = await respondPermission('tc-1', true);
 check('批准走 mux 单条路径', r1 && r1.via === 'mux' && r1.granularity === 'single',
   JSON.stringify(r1));
-check('回给 agent 的是一条 respond', sent.length === 1 && sent[0].kind === 'respond',
+/*
+ * 这里原来断言的是「回一条 JSON-RPC respond，带对的 requestId」——
+ * 那个契约是错的，而且错得很隐蔽：形状完全符合 ACP 规范，测试全绿，实机却无效。
+ *
+ * 原因在 Kiro 产物的 MultiplexStream 里：mux 给每个客户端标了 role，
+ * observer 的 permission 应答会被直接丢弃（日志原文
+ * "discarded observer permission response ... (waiting for _kiro/permission/respond)"），
+ * 只有 primary（拥有会话的桌面面板）的应答才转发给 agent。bridge 是 observer。
+ *
+ * 实测后果：手机点「允许」→ 电脑上的框继续挂着 → 5 分钟（产物里 300*1e3）超时后
+ * 以 cancelled 收场，selectedOption 为空。
+ */
+check('走 _kiro/permission/respond 而不是 JSON-RPC 应答',
+  sent.length === 1 && sent[0].kind === 'extMethod',
   JSON.stringify(sent));
-check('响应带对的 requestId', sent[0] && sent[0].id === 101);
-check('响应形状是 selected + optionId',
-  sent[0] && sent[0].payload.outcome.outcome === 'selected' &&
-  sent[0].payload.outcome.optionId === 'accept',
-  JSON.stringify(sent[0] && sent[0].payload));
+check('带上 sessionId（该方法的必要参数）',
+  sent[0] && sent[0].sessionId === 'sess_x', sent[0] && String(sent[0].sessionId));
+check('带上 toolCallId 与 optionId',
+  sent[0] && sent[0].toolCallId === 'tc-1' && sent[0].optionId === 'accept',
+  JSON.stringify(sent[0]));
+check('不再回 JSON-RPC 应答（会被 mux 当 observer 丢弃）',
+  !sent.some((x) => x.kind === 'respond'), JSON.stringify(sent));
 
 // ================================================================ 3. 手机拒绝
 pendingPermissions.clear();
@@ -123,8 +149,8 @@ sent = [];
 incoming('tc-2', 102);
 await respondPermission('tc-2', false);
 check('拒绝用 deny 的 optionId',
-  sent.length === 1 && sent[0].payload.outcome.optionId === 'reject',
-  JSON.stringify(sent[0] && sent[0].payload));
+  sent.length === 1 && sent[0].optionId === 'reject',
+  JSON.stringify(sent[0]));
 
 // ================================================================ 4. 认不出 allow 时不能假装成功
 // 缺 optionId 的 selected 在协议上是无效响应，agent 会当成取消处理，
@@ -148,7 +174,7 @@ pendingPermissions.get('tc-4').at = Date.now() - 400 * 24 * 60 * 60 * 1000; // 4
 const r4 = await respondPermission('tc-4', true);
 check('挂了 400 天的审批照样能批出去',
   r4 && r4.via === 'mux' && sent.length === 1 &&
-  sent[0].payload.outcome.optionId === 'accept',
+  sent[0].optionId === 'accept',
   JSON.stringify({ via: r4 && r4.via, n: sent.length }));
 
 // ================================================================ 6. 结局对账
@@ -188,8 +214,8 @@ check('记录里存下了全部四个选项',
 
 const r7 = await respondPermission('tc-7', true, 'always-accept');
 check('指定 always-accept 时就发 always-accept（不被推断成 accept）',
-  sent.length === 1 && sent[0].payload.outcome.optionId === 'always-accept',
-  JSON.stringify(sent[0] && sent[0].payload));
+  sent.length === 1 && sent[0].optionId === 'always-accept',
+  JSON.stringify(sent[0]));
 check('应答里回传实际发出的 optionId', r7 && r7.optionId === 'always-accept',
   JSON.stringify(r7));
 
@@ -200,8 +226,8 @@ for (const want of ['accept', 'always-accept', 'reject', 'always-reject']) {
   incoming(`tc-opt-${want}`, 200);
   await respondPermission(`tc-opt-${want}`, !/reject/.test(want), want);
   check(`选项 ${want} 原样发出`,
-    sent.length === 1 && sent[0].payload.outcome.optionId === want,
-    JSON.stringify(sent[0] && sent[0].payload.outcome));
+    sent.length === 1 && sent[0].optionId === want,
+    JSON.stringify(sent[0]));
 }
 
 // 不属于本次请求的 optionId 要被拒绝，而不是照发
@@ -221,8 +247,40 @@ sent = [];
 incoming('tc-9', 109);
 await respondPermission('tc-9', true);
 check('不给 optionId 时退回按 approve 推断（取单次放行）',
-  sent.length === 1 && sent[0].payload.outcome.optionId === 'accept',
-  JSON.stringify(sent[0] && sent[0].payload.outcome));
+  sent.length === 1 && sent[0].optionId === 'accept',
+  JSON.stringify(sent[0]));
+
+// ================================================================ 6c. 提交失败要如实说
+// agent 拒绝或超时时，绝不能让手机端以为批准成功了 —— 这正是此前那个 bug 的形态。
+pendingPermissions.clear();
+sent = [];
+incoming('tc-10', 110);
+failNextRespond = true;
+let subErr = null;
+try { await respondPermission('tc-10', true, 'accept'); } catch (e) { subErr = e; }
+check('提交失败时抛错而不是假装成功', !!subErr && /提交失败/.test(subErr.message),
+  subErr ? subErr.message : '没抛错');
+check('提交失败后 respondedAt 被清掉，可以重试',
+  pendingPermissions.has('tc-10') && !pendingPermissions.get('tc-10').respondedAt);
+sent = [];
+const retry = await respondPermission('tc-10', true, 'accept');
+check('失败后能重新提交', retry && retry.via === 'mux' && sent.length === 1,
+  JSON.stringify(sent));
+
+// 缺 sessionId 时不能瞎发（该方法要求 sessionId）
+pendingPermissions.clear();
+sent = [];
+onMuxInbound({
+  method: 'session/request_permission',
+  id: 111,
+  connection: fakeConn,
+  params: { toolCallId: 'tc-11', title: 'no session', options: REAL_OPTIONS },
+});
+let noSid = null;
+try { await respondPermission('tc-11', true, 'accept'); } catch (e) { noSid = e; }
+check('缺 sessionId 时显式失败而不是发一个不完整的请求',
+  !!noSid && /会话标识/.test(noSid.message) && sent.length === 0,
+  noSid ? noSid.message : '没抛错');
 
 // ================================================================ 7. 任何失败都不退化成整批批准
 check('全过程没有触发 runOrAcceptAll',

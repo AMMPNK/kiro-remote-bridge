@@ -96,7 +96,11 @@ node scripts/package.js
 
 ## 已知限制
 
-**远程批准工具调用尚未确认可用。** 这一条此前写的是「不生效，因为请求已在 agent 侧被自动取消（实测 8 次全部在 6–130ms 内）」。把本机 183 次 `tool_approval` 全部翻出来核对之后，那个结论下得过早：
+**远程批准的根本原因已定位并修复（0.7.0）。** 此前所有版本都在用错的提交机制：bridge 回 JSON-RPC 应答，而 Kiro 的 mux 给每个客户端标了 role，**observer 的 permission 应答会被直接丢弃**（产物里的日志原文：`discarded observer permission response ... (waiting for _kiro/permission/respond)`），只有 `primary`（拥有会话的桌面面板）的应答才转发给 agent。bridge 是 observer。
+
+现在改走 `_kiro/permission/respond`，参数照 Kiro 自己的调用抄：`{ toolCallId, optionId, sessionId }`。
+
+下面这段是定位过程中的实测数据，留作参考。原文曾写「不生效，因为请求已在 agent 侧被自动取消（实测 8 次全部在 6–130ms 内）」—— 那个结论下得过早：
 
 | 结局 | 次数 | 响应间隔 |
 | --- | --- | --- |
@@ -104,6 +108,8 @@ node scripts/package.js
 | `cancelled`（被自动取消） | 10 | 6–130 毫秒 |
 
 被瞬间取消的只占 **5.5%**，其余 173 次请求一直活着等人响应 —— 所以「请求已经死了」不是普遍情况。当初那 8 个样本恰好都落在被取消的那一类里。
+
+而两种 `cancelled` 的耗时差异恰好指向了两种不同的根因：**14ms** 是「没有 handler，直接返回默认值」，**305 秒** 是「有 handler 在等，但它收不到我们的响应，最后超时」（305 秒正是产物里 `300 * 1e3` 那个超时）。后者才是真正要修的问题。
 
 但也**不能**因此说远程批准可用：那 173 次都是从电脑上批的，手机发出的响应到底能不能落地，仍然没有任何直接证据。桥现在会把这件事记进日志 —— 手机批准之后，一旦等到该请求的真实结局，就会打印
 
@@ -133,7 +139,7 @@ node scripts/package.js
 ## 开发
 
 ```bash
-node test/run-all.mjs        # 全量测试（266 项）
+node test/run-all.mjs        # 全量测试（271 项）
 node test/t8-ui-consistency.mjs   # 只跑 UI 一致性门禁
 ```
 

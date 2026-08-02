@@ -196,6 +196,24 @@ class MuxConnection extends EventEmitter {
     return this.request('session/prompt', { sessionId, prompt }, timeoutMs);
   }
 
+  /**
+   * 提交权限请求的结果。
+   *
+   * 必须走 `_kiro/permission/respond` 这个扩展方法，**不能**用 respond() 回 JSON-RPC 应答。
+   * 依据是 Kiro 产物里 MultiplexStream 的分发逻辑：mux 给每个客户端标了 role，
+   *   observer 的 permission 应答会被直接丢弃，日志原文
+   *     "discarded observer permission response ... (waiting for _kiro/permission/respond)"
+   *   只有 primary（拥有会话的桌面面板）的 JSON-RPC 应答才会被转发。
+   * 而 bridge 是 observer，所以此前回的应答全部被静默丢掉 —— 表现为手机点了「允许」，
+   * 电脑上的框继续挂着，直到 5 分钟（产物里 300*1e3）超时后以 cancelled 收场。
+   *
+   * 参数形状照 Kiro 自己的两处调用抄：
+   *   resolve-permission-request.ts  { toolCallId, optionId, _meta }
+   *   supervised-mode.ts             { toolCallId, optionId, sessionId, fileDecisions? }
+   */
+  respondPermission(sessionId, toolCallId, optionId, timeoutMs = 15000) {
+    return this.request('_kiro/permission/respond', { toolCallId, optionId, sessionId }, timeoutMs);
+  }
   cancel(sessionId) {
     return this.notify('session/cancel', { sessionId });
   }
