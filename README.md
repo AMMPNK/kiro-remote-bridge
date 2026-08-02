@@ -133,7 +133,7 @@ node scripts/package.js
 ## 开发
 
 ```bash
-node test/run-all.mjs        # 全量测试（251 项）
+node test/run-all.mjs        # 全量测试（266 项）
 node test/t8-ui-consistency.mjs   # 只跑 UI 一致性门禁
 ```
 

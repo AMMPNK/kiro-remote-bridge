@@ -183,8 +183,18 @@ function buildHandlers() {
     'session:approve': async (msg) => {
       const approve = msg.approve !== false;
       const toolCallId = msg.toolCallId ? String(msg.toolCallId) : null;
-      const r = await respondPermission(toolCallId, approve);
-      return { type: 'approved', approve, toolCallId, via: r.via, granularity: r.granularity };
+      // optionId 由手机端明确给出（用户点的就是哪个）。没给时才退回按 approve 推断，
+      // 那是老外壳页的兼容路径。
+      const optionId = msg.optionId ? String(msg.optionId) : null;
+      const r = await respondPermission(toolCallId, approve, optionId);
+      return {
+        type: 'approved',
+        approve,
+        toolCallId,
+        optionId: r.optionId || optionId,
+        via: r.via,
+        granularity: r.granularity,
+      };
     },
 
     'session:cancel': async (msg) => {
@@ -762,7 +772,15 @@ function prunePendingPermissions(now = Date.now()) {
   return n;
 }
 
-async function respondPermission(toolCallId, approve) {
+/**
+ * 响应一个权限请求。
+ *
+ * @param {string} toolCallId
+ * @param {boolean} approve 兼容老外壳页的粗粒度意图
+ * @param {string|null} wantOptionId 手机端明确点的那个 optionId。给了就用它 ——
+ *   四个选项里 allow_once 与 allow_always 的作用范围差别很大，不该替用户猜。
+ */
+async function respondPermission(toolCallId, approve, wantOptionId = null) {
   const rec = toolCallId && pendingPermissions.get(toolCallId);
   // 已经有结局的，如实说清楚。不要退到整批命令路径 —— 那会对当前活动会话执行
   // runOrAcceptAll，作用范围远大于用户以为自己在批准的那一个工具调用。
@@ -782,7 +800,19 @@ async function respondPermission(toolCallId, approve) {
   }
   if (rec) {
     const { connection, requestId, optionIds } = rec;
-    const optionId = approve ? optionIds.allow : optionIds.deny;
+    let optionId;
+    if (wantOptionId) {
+      // 只接受确实存在于这次请求里的 optionId，避免把手机端的笔误当成有效选择
+      const known = (rec.options || []).some((o) => o && o.optionId === wantOptionId);
+      if (!known) {
+        const avail = (rec.options || []).map((o) => o && o.optionId).filter(Boolean);
+        log(`[approve] optionId=${wantOptionId} 不在本次请求的选项里（可选: ${avail.join(',')}）`);
+        throw new Error(`这个选项不属于本次请求（可选：${avail.join(' / ') || '无'}）`);
+      }
+      optionId = wantOptionId;
+    } else {
+      optionId = approve ? optionIds.allow : optionIds.deny;
+    }
     // 放行必须带上具体 optionId：缺 optionId 的 selected 在协议上是无效响应，agent 侧会
     // 当成取消处理，而手机端却会看到「已回应」。宁可显式失败，也不要制造这种假成功。
     if (approve && !optionId) {
@@ -798,11 +828,15 @@ async function respondPermission(toolCallId, approve) {
     // 由 prunePendingPermissions 按 TTL 回收。
     rec.respondedAt = Date.now();
     rec.respondedApprove = !!approve;
+    rec.respondedOptionId = optionId || null;
+    // 把发出去的原始形状也记进日志：远程批准不生效时，第一件要核对的就是这个
     log(
-      `[approve] via mux toolCallId=${toolCallId} approve=${approve} optionId=${optionId || '-'}` +
+      `[approve] via mux toolCallId=${toolCallId} requestId=${requestId} ` +
+        `optionId=${optionId || '-'}${wantOptionId ? '（手机指定）' : '（按 approve 推断）'} ` +
+        `payload=${JSON.stringify({ outcome: { outcome: 'selected', optionId } })}` +
         '（已发出，等结局对账）'
     );
-    return { via: 'mux', granularity: 'single' };
+    return { via: 'mux', granularity: 'single', optionId: optionId || null };
   }
   const cmd = approve ? 'kiroAgent.execution.runOrAcceptAll' : 'kiroAgent.execution.rejectAll';
   await vscode.commands.executeCommand(cmd);
@@ -831,6 +865,10 @@ function onMuxInbound(m) {
       connection,
       requestId: id,
       at: Date.now(),
+      // 原样存下全部选项：手机端要把它们逐个显示成按钮，并回传用户点的那个 optionId。
+      // 只存 allow/deny 两个推断结果是不够的 —— 四个选项里 allow_once 与 allow_always
+      // 的作用范围差别很大，替用户猜一个是不对的。
+      options,
       optionIds: { allow: find(/allow|approve|accept/i), deny: find(/reject|deny|cancel/i) },
     });
     log(`[mux] 收到权限请求 toolCallId=${toolCallId} options=${JSON.stringify(options).slice(0, 200)}`);

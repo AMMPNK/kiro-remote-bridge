@@ -176,6 +176,20 @@ check('选项标签同时认 name 与 title',
 check('待确认卡片走 optionLabels 而不是直接取 title',
   /case 'pending':[\s\S]{0,400}?optionLabels\(m\.options\)/.test(script));
 
+// ---- 9d. 授权框的按钮必须由 options 生成，不能写死两个
+// 实测：只给「允许 / 拒绝」时用户无法知道自己批的是单次还是永久，而 allow_once 与
+// allow_always 的作用范围差别很大。四个选项都要摆出来，且点哪个就回哪个 optionId。
+check('授权框按钮由 options 动态生成',
+  /p\.options[\s\S]{0,600}?data-opt=/.test(script),
+  '应按 p.options 渲染按钮');
+check('点击时把具体 optionId 发回去',
+  /payload\.optionId = optionId|optionId: *optionId/.test(script) &&
+  /session:approve/.test(script));
+check('不再写死 pok / pno 两个按钮',
+  !/id="pok"|id="pno"|el\('pok'\)|el\('pno'\)/.test(html));
+check('授权按钮容器 #pacts 存在且被使用',
+  /id="pacts"/.test(html) && /el\('pacts'\)/.test(script));
+
 // ---- 10. 停止键的两个已知失效方向
 // 这几条是针对具体缺陷的回归闸门，不是泛化检查：写这个按钮时两个方向各踩了一次。
 check('停止键会发出 session:cancel',

@@ -175,6 +175,55 @@ check('已被 agent 取消的请求，点了会说清楚而不是假装成功',
   !!canc && /已被取消/.test(canc.message), canc ? canc.message : '没抛错');
 check('对已取消的请求不回任何响应', sent.length === 0, JSON.stringify(sent));
 
+// ================================================================ 6b. 手机指定 optionId
+// 实测：手机上只给「允许 / 拒绝」两个按钮时，用户无法知道自己批的是单次还是永久，
+// 而 allow_once 与 allow_always 的作用范围差别很大。所以四个选项都要摆出来，
+// 并且用户点的那个 optionId 必须原样发出去，不能被后端的推断覆盖。
+pendingPermissions.clear();
+sent = [];
+incoming('tc-7', 107);
+check('记录里存下了全部四个选项',
+  (pendingPermissions.get('tc-7').options || []).length === 4,
+  `${(pendingPermissions.get('tc-7').options || []).length} 个`);
+
+const r7 = await respondPermission('tc-7', true, 'always-accept');
+check('指定 always-accept 时就发 always-accept（不被推断成 accept）',
+  sent.length === 1 && sent[0].payload.outcome.optionId === 'always-accept',
+  JSON.stringify(sent[0] && sent[0].payload));
+check('应答里回传实际发出的 optionId', r7 && r7.optionId === 'always-accept',
+  JSON.stringify(r7));
+
+// 四个选项逐个都要能原样发出
+for (const want of ['accept', 'always-accept', 'reject', 'always-reject']) {
+  pendingPermissions.clear();
+  sent = [];
+  incoming(`tc-opt-${want}`, 200);
+  await respondPermission(`tc-opt-${want}`, !/reject/.test(want), want);
+  check(`选项 ${want} 原样发出`,
+    sent.length === 1 && sent[0].payload.outcome.optionId === want,
+    JSON.stringify(sent[0] && sent[0].payload.outcome));
+}
+
+// 不属于本次请求的 optionId 要被拒绝，而不是照发
+pendingPermissions.clear();
+sent = [];
+incoming('tc-8', 108);
+let bad = null;
+try { await respondPermission('tc-8', true, 'not-a-real-option'); } catch (e) { bad = e; }
+check('不属于本次请求的 optionId 被拒绝', !!bad && /不属于本次请求/.test(bad.message),
+  bad ? bad.message : '没抛错');
+check('被拒绝时不对 agent 发任何东西', sent.length === 0, JSON.stringify(sent));
+check('被拒绝后记录还在（用户可以重新选）', pendingPermissions.has('tc-8'));
+
+// 没给 optionId 时退回推断（老外壳页的兼容路径）
+pendingPermissions.clear();
+sent = [];
+incoming('tc-9', 109);
+await respondPermission('tc-9', true);
+check('不给 optionId 时退回按 approve 推断（取单次放行）',
+  sent.length === 1 && sent[0].payload.outcome.optionId === 'accept',
+  JSON.stringify(sent[0] && sent[0].payload.outcome));
+
 // ================================================================ 7. 任何失败都不退化成整批批准
 check('全过程没有触发 runOrAcceptAll',
   !executed.includes('kiroAgent.execution.runOrAcceptAll'), executed.join(','));

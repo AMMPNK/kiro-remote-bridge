@@ -205,6 +205,13 @@
   #pend .q{font-size:13px;line-height:1.5;color:#ffe9b8;white-space:pre-wrap;
     max-height:120px;overflow-y:auto}
   #pend .acts{display:flex;gap:8px;margin-top:11px}
+  /*
+    四个选项在手机上一行摆不开（"Always allow" 这种标签本身就长），所以两列网格。
+    每个按钮显示 agent 给的原文标签，不做翻译或合并 —— 用户要能确切知道自己点的是
+    单次还是永久。
+  */
+  #pend .acts.grid{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+  #pend .acts.grid button{width:100%;font-size:13.5px;padding:11px 8px}
   #pend button{flex:1;padding:10px;border-radius:9px;font:inherit;font-size:14px;
     font-weight:500;border:1px solid var(--line2);background:var(--card2);color:var(--fg)}
   #pend button.ok{background:var(--green);border-color:var(--green);color:#05210c}
@@ -331,12 +338,15 @@
     </div>
   </header>
 
+  <!--
+    授权框的按钮由后端送来的 options 动态生成，不写死。
+    实测工具授权有四个选项（Allow / Always allow / Deny / Always deny），
+    只摆「允许 / 拒绝」两个的话，用户没法知道自己批的到底是单次还是永久 ——
+    而这两者的作用范围差别很大。
+  -->
   <div id="pend" class="hide">
     <div class="q" id="pq"></div>
-    <div class="acts">
-      <button class="ok" id="pok">允许</button>
-      <button class="no" id="pno">拒绝</button>
-    </div>
+    <div class="acts" id="pacts"></div>
   </div>
 
   <main id="main"></main>
@@ -1118,11 +1128,59 @@ el('stop').onclick = () => {
 
 // ---------------------------------------------------------------- 待批准
 let pendingItem = null;
+/**
+ * 按 kind / optionId 判断某个选项是「放行」还是「拒绝」，只用来决定按钮配色。
+ * 判不出来就当中性，不猜。
+ */
+function optionTone(o) {
+  const s = `${(o && o.kind) || ''} ${(o && o.optionId) || ''}`.toLowerCase();
+  if (/allow|approve|accept/.test(s)) return 'ok';
+  if (/reject|deny|cancel/.test(s)) return 'no';
+  return '';
+}
+
 function showPending(p) {
   pendingItem = p;
   el('pq').textContent = [p.title, p.detail].filter(Boolean).join('\n') || '需要确认';
+
+  // 按后端送来的 options 逐个生成按钮。用户点哪个就回哪个 optionId，
+  // 不在手机端替他推断 —— allow_once 和 allow_always 的后果差很多。
+  const opts = Array.isArray(p.options) ? p.options.filter((o) => o && o.optionId) : [];
+  const box = el('pacts');
+  if (opts.length) {
+    box.className = 'acts grid';
+    box.innerHTML = opts.map((o) =>
+      `<button class="${optionTone(o)}" data-opt="${escAttr(o.optionId)}">` +
+      `${esc(o.name || o.title || o.optionId)}</button>`
+    ).join('');
+    box.querySelectorAll('button').forEach((b) => {
+      const opt = opts.find((o) => o.optionId === b.dataset.opt);
+      b.onclick = () => respondPending(b.dataset.opt, optionTone(opt) !== 'no');
+    });
+  } else {
+    // 后端没给选项（老版本或非工具授权），退回两个粗粒度按钮
+    box.className = 'acts';
+    box.innerHTML = '<button class="ok" data-fallback="1">允许</button>' +
+      '<button class="no" data-fallback="0">拒绝</button>';
+    box.querySelectorAll('button').forEach((b) => {
+      b.onclick = () => respondPending(null, b.dataset.fallback === '1');
+    });
+  }
+
   el('pend').classList.remove('hide');
   if (navigator.vibrate) navigator.vibrate([40, 60, 40]);
+}
+
+/** 把用户点的那个选项发回去。optionId 为 null 时退回粗粒度的 approve 语义。 */
+function respondPending(optionId, approve) {
+  const payload = {
+    sessionId: openId,
+    toolCallId: pendingItem && pendingItem.toolCallId,
+    approve,
+  };
+  if (optionId) payload.optionId = optionId;
+  send('session:approve', payload);
+  hidePending();
 }
 function hidePending() {
   pendingItem = null;
@@ -1146,14 +1204,8 @@ function reconcilePending(msgs) {
     return;
   }
 }
-el('pok').onclick = () => {
-  send('session:approve', { sessionId: openId, toolCallId: pendingItem && pendingItem.toolCallId, approve: true });
-  hidePending();
-};
-el('pno').onclick = () => {
-  send('session:approve', { sessionId: openId, toolCallId: pendingItem && pendingItem.toolCallId, approve: false });
-  hidePending();
-};
+// 授权按钮已改为按 options 动态生成，绑定在 showPending 里完成。
+// 原来这里写死了 #pok / #pno 两个按钮的 onclick，那两个元素已经不存在。
 
 // ---------------------------------------------------------------- 连接
 function showBlocker(text, hint) {
@@ -1258,8 +1310,14 @@ function connect() {
         setTurnActive(false);
         break;
       // 「已发出」不等于「已被接受」—— 真实结局由 resolved 增量给出，见 reconcilePending
+      // 「已发出」不等于「已生效」。带上实际发出的 optionId，这样电脑上框还挂着的时候
+      // 能立刻看出是发错了选项，还是发对了但 agent 没接受。
       case 'approved':
-        toast(m.granularity === 'single' ? '批准已发出' : '批准已发出（整批）');
+        toast(
+          (m.optionId ? `已发出：${m.optionId}` : '批准已发出') +
+            (m.granularity === 'single' ? '' : '（整批）') +
+            ' · 等 agent 确认'
+        );
         break;
       case 'workspaces':
         wsList = m.items || [];
