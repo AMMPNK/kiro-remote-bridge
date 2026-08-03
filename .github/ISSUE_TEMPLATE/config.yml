@@ -1,0 +1,17 @@
+# 关掉「空白 issue」入口，强制走上面两个模板。
+# 理由很实际：模板里的那几项（Kiro 版本、进入路径、日志脱敏）几乎每次都要问一遍，
+# 空白 issue 只会多一轮来回。
+blank_issues_enabled: false
+
+contact_links:
+  - name: 安全问题（不要开公开 issue）
+    url: https://github.com/AMMPNK/kiro-remote-bridge/security/advisories/new
+    about: >-
+      持有访问 token 等于能让那台机器执行命令，所以漏洞在修好之前不该公开。
+      请走 Security Advisory 私下报告，详见 SECURITY.md。
+
+  - name: 先读一遍已知限制
+    url: https://github.com/AMMPNK/kiro-remote-bridge#已知限制
+    about: >-
+      公网访问、user_input 交互、模型清单不完整这几项是已知且刻意的，
+      开 issue 之前先看一眼能省掉一轮。

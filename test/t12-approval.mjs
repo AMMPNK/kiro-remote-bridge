@@ -97,7 +97,8 @@ const incoming = (toolCallId, id, options = REAL_OPTIONS) => {
     params: {
       sessionId: 'sess_x',
       toolCallId,
-      title: 'feishu-mcp-pro/app_scopes',
+      // 用中性的示例名，不写真实 MCP 服务名 —— 服务名本身会暴露作者在用什么工具链
+      title: 'example-mcp/list_items',
       options,
     },
   });
@@ -359,7 +360,7 @@ check('未处理的授权能按会话取出来', forSess.length === 2, `拿到 $
 // undefined、options 是 undefined —— 框能弹但一个按钮都没有，等于白重放。
 check('重放数据带 toolCallId', forSess.every((p) => p.toolCallId),
   JSON.stringify(forSess.map((p) => p.toolCallId)));
-check('重放数据带标题', forSess.every((p) => p.title === 'feishu-mcp-pro/app_scopes'),
+check('重放数据带标题', forSess.every((p) => p.title === 'example-mcp/list_items'),
   JSON.stringify(forSess.map((p) => p.title)));
 check('重放数据带四个选项',
   forSess.every((p) => Array.isArray(p.options) && p.options.length === 4),
