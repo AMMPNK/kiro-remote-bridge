@@ -4,7 +4,18 @@
 
 一个 VS Code 扩展 + 一个自带的手机端页面。零运行时依赖，只用 Node 标准库。
 
-> 状态：能日常用，但有几个明确的已知限制，见[已知限制](#已知限制)。请先读那一节再决定要不要装。
+## 先说清楚这是什么
+
+我不是技术出身，是个产品经理。这个东西是为了解决我自己的一个痛点：agent 在我电脑上跑长任务，我想离开桌子但又不想失去对进度的可见性。做出来之后在公司和校园网这类局域网环境下刚好够用，就整理出来分享给同事，希望能帮上忙。
+
+**几件必须提前说的：**
+
+- **代码的严谨程度我没有能力负责。** 大部分实现是我和 AI 一起完成的，测试写了 271 条、也逐个跑通了，但那不等于没有设计缺陷或安全漏洞。**装之前请自己审计一遍代码**，尤其是 `src/relay.js`（对外的 HTTP/WebSocket 入口）和 `src/extension.js`（权限响应逻辑）。文件不多，全部只用 Node 标准库，没有第三方依赖，读起来不费劲。
+- **这个服务会打开一个能驱动你 agent 的入口。** 拿到访问 URL 的人可以看你全部会话历史、发消息、批准工具调用 —— 也就是能让你的机器执行命令。请务必读完[安全说明](#安全说明)再决定。
+- **只在 macOS + 局域网下验证过。** 出了这个范围我不知道会怎样。
+- **欢迎提建议、也欢迎直接改。** 你 fork 过去改成自己的样子完全没问题（MIT）。发现问题告诉我，或者直接提 PR，我都很感谢。
+
+> 另有几个明确的已知限制，见[已知限制](#已知限制)。版本历史见 [CHANGELOG](./CHANGELOG.md)。
 
 ## 为什么会有这个东西
 
@@ -23,22 +34,23 @@
 - **扫码即用** —— 局域网内扫二维码打开，带 token 鉴权
 - **能在手机上批准工具调用** —— 四个选项（Allow / Always allow / Deny / Always deny）逐个显示，点哪个就提交哪个；实机验证通过
 - **等审批不会自己作废** —— 有审批就一直等你，行为与电脑端一致；等确认的会话在列表上是琥珀色「待确认」并排到最前
-- **一致性门禁** —— 251 个测试，含审批链路端到端验证与 UI 一致性检查（DOM id / CSS class / 前后端消息类型双向对齐 / 解析器 kind 与渲染分支对齐）
+- **一致性门禁** —— 271 个测试，含审批链路端到端验证与 UI 一致性检查（DOM id / CSS class / 前后端消息类型双向对齐 / 解析器 kind 与渲染分支对齐）
 
 ## 快速开始
 
 需要 macOS + Kiro IDE。（只在 macOS 上验证过；代码本身没有平台假设，但安装脚本里的路径是 macOS 的。）
 
 ```bash
-git clone <your-repo-url> kiro-remote-bridge
+git clone https://github.com/AMMPNK/kiro-remote-bridge.git
 cd kiro-remote-bridge
 
 # 打包
 node scripts/package.js
 
 # 安装（推荐走官方 CLI，会写入完整 metadata）
-"/Applications/Kiro.app/Contents/Resources/app/bin/code" \
-  --install-extension dist/local.kiro-remote-bridge-<version>.vsix --force
+# 版本号从 package.json 取，这样这条命令不会因为发了新版就过时
+"/Applications/Kiro.app/Contents/Resources/app/bin/code" --force \
+  --install-extension "dist/local.kiro-remote-bridge-$(node -p "require('./package.json').version").vsix"
 ```
 
 然后在 Kiro 里重载窗口（命令面板 → `Developer: Reload Window`），再执行：
@@ -135,12 +147,28 @@ discarded observer permission response ... (waiting for _kiro/permission/respond
 
 ## 安全说明
 
+> **0.7.0 起 token 的权力变大了，请重新评估。** 在此之前远程批准工具调用是坏的，所以拿到 token 最多能看历史和发消息。现在批准能生效了 —— **持有 token 就等于能让这台机器执行命令**，而工具审批本来是最后一道闸门。如果你之前按「只能看」来评估风险，请按这一条重新判断。
+
 - 中继**默认监听 `0.0.0.0`**，即同一局域网内可达。不要在不可信网络（公共 WiFi、共享办公网）里开着。
+- **手机上点 `Always allow` 只对当前会话生效，不会永久授权。** 这和电脑上不一样，是刻意保留的差异：Kiro 按响应里 `_meta.kiro.scope` 决定持久化范围（`session` 只进内存、`user` 写 `~/.kiro/settings/permissions.yaml`、`workspace` 写工作区），而本项目不发送 `_meta`，于是落到默认的 `session`。所以远程误点一下不会给你留下一条永久放行规则 —— 代价是按钮上写着「Always」却只管这一个会话。真要永久放行，请在电脑上操作。
+- **审批的实际破坏力取决于你的 `permissions.yaml`。** 那份白名单是历史上一路点「Always allow」攒出来的，很容易长到上百条并包含 `rm`、`bash`、`curl`。开这个服务之前建议先看一眼：`Kiro Bridge` 用不到它，但 agent 用得到。命令面板里的 `Kiro: Open Permissions (User)` 能直接打开。
 - 鉴权是 URL 里的 token，43 字符随机生成，**持久化在 `~/.kiro-bridge/relay-token.json`（权限 0600）**。持久化是为了让「人在外面、机器重启一次」不至于永久失联；代价是泄露后长期有效，所以怀疑泄露就执行 `Kiro Bridge: 轮换访问 token`（旧链接立即失效，手机需重新扫码）。
 - 二维码与访问地址里含 token，不要截图外发。
 - `~/.kiro-bridge/` 目录权限 0700，里面所有文件 0600。这里会有会话标题、工作区绝对路径、mux token，敏感度按最高的那份对待。
 - **扩展在你执行「启动远程会话」之前不会连接 agent，也不写任何文件。** 曾经有一段激活后无条件跑的只读探测（连全部 mux、发 4 个 RPC、把 mux token 落盘），现在收在 `kiroBridge.debugProbeOnStartup` 开关下，默认关闭。需要排障时打开它，或直接用 `Kiro Bridge: 探测 agent 方法` 命令跑一次。
 - 静态资源做了路径穿越防护；外壳页可无 token 加载，但不含任何会话数据。
+
+## 在公司或学校网络里用之前
+
+这一节是给同事的。上面的安全说明讲的是「这个工具本身有多大权限」，这一节讲「你所在的环境允许不允许」—— 后者我没法替你判断。
+
+- **明文 HTTP，没有 TLS。** 会话历史里有你的代码、文档内容、工作区绝对路径，这些会以明文经过局域网。在受管控的公司网络里这可能本身就是个合规问题，值得先问一下。
+- **会开一个监听 `0.0.0.0` 的端口（默认 3939）。** 有些公司的终端安全策略会拦、会告警、或者干脆不允许。
+- **同一网络下的其他人只要拿到 URL 就能进。** 鉴权只有 URL 里那个 43 字符 token，没有设备绑定、没有二次确认。共享办公网、教学楼 WiFi 这类环境要特别小心。
+- **不建议为了远程访问去开公网隧道。** 理由见[出门在外怎么用](#出门在外怎么用)。如果要跨网络，组网（Tailscale / ZeroTier）比暴露端口安全得多 —— 但装第三方组网工具本身在很多公司也是要报备的。
+- **Tailscale 打不通直连时会走 DERP 中继**，流量端到端加密，但链路会经过第三方服务器。如果你的数据不允许出境或经过外部设施，这一点要先确认。
+
+我的实际用法是：公司内网 + 只在需要离开工位时开着 + 用完执行 `Kiro Bridge: 停止远程会话`。**不建议让它长期挂着。**
 
 ## 开发
 
@@ -176,6 +204,14 @@ cd test/ref && npm i
 平心而论，对方在 Cloudflare Tunnel、推送通知、PWA 离线支持上更完整，**工具审批也确实是能用的**（走 hook 拦截点，绕开了本项目遇到的 ACP 权限请求被自动取消的问题）。本项目的侧重是直接说 ACP 协议、零依赖、以及把降级路径显式化。
 
 同类项目还有 [Homas/kiro-telegram-integration](https://github.com/Homas/kiro-telegram-integration)，走 IM 转发通知与审批，目标相近而路子不同。
+
+## 反馈与贡献
+
+- 有问题或建议，开一个 [Issue](https://github.com/AMMPNK/kiro-remote-bridge/issues) 就好，说清你的环境（Kiro 版本、macOS 版本、手机浏览器）会更容易定位。
+- 想直接改的话，PR 我都会看。本地跑一下 `node test/run-all.mjs` 确认 271 条全绿即可，没有别的要求。
+- 如果你把它 fork 去做成自己的版本，完全欢迎，不用告诉我 —— MIT 许可，拿去用就是了。
+
+再重复一次开头那句：**代码的严谨程度我没有能力负责，装之前请自己审计。** 如果你看出问题，尤其是安全上的，麻烦告诉我一声。
 
 ## License
 

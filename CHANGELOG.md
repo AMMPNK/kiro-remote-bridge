@@ -4,6 +4,35 @@
 
 > 0.1.2 及更早的版本在本文件建立之前，未逐条记录。
 
+## [未发布]
+
+### 文档
+
+准备开源分享，README 按「给同事看」重写了几处：
+
+- 顶部加作者声明与免责：作者非技术出身，实现主要由 AI 协作完成，**代码严谨程度无法负责，装之前请自行审计**，并指明该先看哪两个文件（`src/relay.js` 是对外入口、`src/extension.js` 是权限响应逻辑）。
+- 新增「在公司或学校网络里用之前」一节。原有的安全说明讲的是「这个工具有多大权限」，这一节讲「你所在的环境允不允许」：明文 HTTP 会让代码与文档内容过局域网、会开 `0.0.0.0` 监听端口可能触发终端安全策略、同网段拿到 URL 即可进入、Tailscale 打不通直连时会经 DERP 中继。
+- 安全说明置顶一条 **0.7.0 的能力变化提醒**：此前远程批准是坏的，所以 token 最多能看历史；现在批准能生效，持有 token 等于能让机器执行命令。按旧认知评估过风险的人需要重新判断。
+- 修掉三处会直接卡住新用户的问题：`git clone <your-repo-url>` 占位符、特性列表里 251 与实际 271 不一致、CHANGELOG 在 README 里零引用。
+- 安装命令的版本号改为从 `package.json` 读取，不再写死 —— 写死等于制造一个必然过时的副本。
+
+### 查清了 Always allow 的真实行为
+
+手机上点 `Always allow` **只对当前会话生效，不会永久授权**，与电脑上不同。
+
+链路（读 Kiro 产物确认）：`cr9()` 计算待持久化的 consent 时，
+`scope: metaConsent?.scope || "session"` —— scope 取自响应的 `_meta.kiro.scope`。
+而 `persistConsent()` 按 scope 分三路：`session` 只 push 进内存 `sessionRules`、
+`user` 写 `~/.kiro/settings/permissions.yaml`、`workspace` 写工作区配置。
+
+桌面 UI 响应时会带 `_meta`（默认 `user`），所以永久生效；本项目提交时只传
+`{ toolCallId, optionId, sessionId }`、不带 `_meta`，于是落到默认的 `session`。
+这解释了实测现象：手机上点 `always-accept` 之后，
+`~/.kiro/settings/permissions.yaml` 里并没有新增对应规则。
+
+**决定不改行为**：对一个远程入口来说，「误点一下不会留下永久放行规则」是更合适的默认。
+代价是按钮上写着「Always」却只管当前会话 —— 这一点已如实写进安全说明。
+
 ## [0.7.0]
 
 **远程审批的根本原因找到了，改用正确的提交通道。** 此前所有版本都在用错的机制。
