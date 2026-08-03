@@ -192,6 +192,8 @@ function buildHandlers() {
         approve,
         toolCallId,
         optionId: r.optionId || optionId,
+        // scope=user 表示永久授权，手机端会在 toast 里标出来
+        scope: r.scope || null,
         via: r.via,
         granularity: r.granularity,
       };
@@ -836,15 +838,34 @@ async function respondPermission(toolCallId, approve, wantOptionId = null) {
       log(`[approve] toolCallId=${toolCallId} 缺 sessionId，无法调用 _kiro/permission/respond`);
       throw new Error('这次请求缺少会话标识，没法提交（请在手机上重新打开该会话再试）。');
     }
+    /*
+     * *_always 选项要带上持久化范围，取 'user' —— 与电脑端一致（桌面响应时
+     * enrichResponseWithConsent 里 scope 默认就是 "user"，写 ~/.kiro/settings/permissions.yaml）。
+     *
+     * 不传的话 agent 侧落到默认 'session'，只进内存、会话结束即失效 —— 那就成了
+     * 「按钮写着 Always 却只管这一个会话」。0.7.0 及之前就是这个状态，而我当时把它
+     * 记成了「限制」，其实只是少传了这个字段。
+     *
+     * 不额外加确认或过滤：Kiro 只在允许永久授权时才把 *_always 放进选项列表
+     * （ar8() 里 askType === "explicit" 时根本不给），所以能点到就说明它认可。
+     * 在这之上再加一层判断，该生效时是多余的、不该生效时是有害的。
+     */
+    const picked = (rec.options || []).find((o) => o && o.optionId === optionId);
+    const isAlways = /_always$/.test(String((picked && picked.kind) || ''));
+    const scope = isAlways ? 'user' : null;
+
     rec.respondedAt = Date.now();
     rec.respondedApprove = !!approve;
     rec.respondedOptionId = optionId || null;
+    rec.respondedScope = scope;
     log(
       `[approve] 提交 _kiro/permission/respond sessionId=${sid} toolCallId=${toolCallId} ` +
-        `optionId=${optionId}${wantOptionId ? '（手机指定）' : '（按 approve 推断）'}`
+        `optionId=${optionId}${wantOptionId ? '（手机指定）' : '（按 approve 推断）'} ` +
+        `kind=${(picked && picked.kind) || '?'} scope=${scope || '(默认 session)'}` +
+        `${isAlways ? ' ★ 永久，会写进 permissions.yaml' : ''}`
     );
     try {
-      await connection.respondPermission(sid, toolCallId, optionId);
+      await connection.respondPermission(sid, toolCallId, optionId, scope);
       log(`[approve] ★ _kiro/permission/respond 已被接受 toolCallId=${toolCallId}`);
     } catch (err) {
       // 失败要如实说，不能让手机端以为批准了
@@ -854,7 +875,7 @@ async function respondPermission(toolCallId, approve, wantOptionId = null) {
       throw new Error(`提交失败：${msg}`);
     }
     // 刻意不删记录：留着才能在结局到达时对上账
-    return { via: 'mux', granularity: 'single', optionId: optionId || null };
+    return { via: 'mux', granularity: 'single', optionId: optionId || null, scope };
   }
   const cmd = approve ? 'kiroAgent.execution.runOrAcceptAll' : 'kiroAgent.execution.rejectAll';
   await vscode.commands.executeCommand(cmd);

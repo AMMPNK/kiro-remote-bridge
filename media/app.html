@@ -1312,9 +1312,12 @@ function connect() {
       // 「已发出」不等于「已被接受」—— 真实结局由 resolved 增量给出，见 reconcilePending
       // 「已发出」不等于「已生效」。带上实际发出的 optionId，这样电脑上框还挂着的时候
       // 能立刻看出是发错了选项，还是发对了但 agent 没接受。
+      // 「已发出」不等于「已生效」。带上实际发出的 optionId 与持久化范围：
+      // scope=user 表示这次是永久授权、会写进 permissions.yaml，值得让人看见。
       case 'approved':
         toast(
           (m.optionId ? `已发出：${m.optionId}` : '批准已发出') +
+            (m.scope === 'user' ? ' · 永久' : '') +
             (m.granularity === 'single' ? '' : '（整批）') +
             ' · 等 agent 确认'
         );

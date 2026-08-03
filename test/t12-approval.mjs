@@ -68,12 +68,12 @@ const fakeConn = {
   respondError: (id, code, message) => sent.push({ kind: 'error', id, code, message }),
   // 正确的提交通道。bridge 是 mux 的 observer 角色，回 JSON-RPC 应答会被丢弃，
   // 必须调 _kiro/permission/respond。
-  respondPermission: async (sessionId, toolCallId, optionId) => {
+  respondPermission: async (sessionId, toolCallId, optionId, scope) => {
     if (failNextRespond) {
       failNextRespond = false;
       throw new Error('agent rejected');
     }
-    sent.push({ kind: 'extMethod', sessionId, toolCallId, optionId });
+    sent.push({ kind: 'extMethod', sessionId, toolCallId, optionId, scope: scope || null });
     return {};
   },
 };
@@ -249,6 +249,54 @@ await respondPermission('tc-9', true);
 check('不给 optionId 时退回按 approve 推断（取单次放行）',
   sent.length === 1 && sent[0].optionId === 'accept',
   JSON.stringify(sent[0]));
+
+// ================================================================ 6b-2. 永久授权的范围
+// *_always 选项必须带 scope='user'，与电脑端一致（桌面响应时 scope 默认就是 user，
+// 写 ~/.kiro/settings/permissions.yaml）。不带的话 agent 落到默认 'session'，
+// 只进内存、会话结束即失效 —— 那就是「按钮写着 Always 却只管这一个会话」。
+// 0.7.0 及之前就是这个状态，而当时被误记成了「限制」，其实只是少传一个字段。
+const SCOPE_CASES = [
+  ['accept', 'allow_once', null],
+  ['always-accept', 'allow_always', 'user'],
+  ['reject', 'reject_once', null],
+  ['always-reject', 'reject_always', 'user'],
+];
+for (const [optId, kind, wantScope] of SCOPE_CASES) {
+  pendingPermissions.clear();
+  sent = [];
+  incoming(`tc-scope-${optId}`, 300);
+  await respondPermission(`tc-scope-${optId}`, !/reject/.test(optId), optId);
+  const got = sent[0] || {};
+  check(`${optId}（${kind}）的 scope 应为 ${wantScope || '不传'}`,
+    sent.length === 1 && got.scope === wantScope,
+    `实际 scope=${JSON.stringify(got.scope)}`);
+}
+
+// 单次选项不该带 scope —— 带了虽然无害，但语义上 scope 只对持久化有意义
+pendingPermissions.clear();
+sent = [];
+incoming('tc-once-clean', 301);
+await respondPermission('tc-once-clean', true, 'accept');
+check('单次放行不声明 scope', sent[0] && sent[0].scope === null,
+  JSON.stringify(sent[0]));
+
+// 应答里要把 scope 回传给手机端，让 toast 能标出「永久」
+pendingPermissions.clear();
+sent = [];
+incoming('tc-scope-echo', 302);
+const rScope = await respondPermission('tc-scope-echo', true, 'always-accept');
+check('应答回传 scope=user', rScope && rScope.scope === 'user', JSON.stringify(rScope));
+
+// kind 认不出来时不要瞎猜成永久 —— 宁可退回 session（更保守的那一侧）
+pendingPermissions.clear();
+sent = [];
+incoming('tc-weird-kind', 303, [
+  { optionId: 'yes', name: 'Yes', kind: 'something_unknown' },
+  { optionId: 'reject', name: 'Deny', kind: 'reject_once' },
+]);
+await respondPermission('tc-weird-kind', true, 'yes');
+check('kind 无法识别时不声明 scope（偏保守）',
+  sent[0] && sent[0].scope === null, JSON.stringify(sent[0]));
 
 // ================================================================ 6c. 提交失败要如实说
 // agent 拒绝或超时时，绝不能让手机端以为批准成功了 —— 这正是此前那个 bug 的形态。

@@ -211,8 +211,23 @@ class MuxConnection extends EventEmitter {
    *   resolve-permission-request.ts  { toolCallId, optionId, _meta }
    *   supervised-mode.ts             { toolCallId, optionId, sessionId, fileDecisions? }
    */
-  respondPermission(sessionId, toolCallId, optionId, timeoutMs = 15000) {
-    return this.request('_kiro/permission/respond', { toolCallId, optionId, sessionId }, timeoutMs);
+  /**
+   * @param {string|null} scope 持久化范围,只对 *_always 选项有意义:
+   *   'user'      写 ~/.kiro/settings/permissions.yaml,永久生效（桌面端的默认）
+   *   'workspace' 写工作区的 permissions.yaml
+   *   'session'   只进内存,会话结束即失效
+   *   不传        agent 侧落到默认值 'session'
+   *
+   * 依据 Kiro 产物：cr9() 里 `scope: metaConsent?.scope || "session"`,
+   * metaConsent 取自本方法的 `_meta.kiro.consent`；persistConsent() 再按 scope 分三路写盘。
+   * Kiro 自己在 resolve-permission-request.ts 里也是这样带 _meta 调用的。
+   */
+  respondPermission(sessionId, toolCallId, optionId, scope = null, timeoutMs = 15000) {
+    const params = { toolCallId, optionId, sessionId };
+    // 只在需要持久化时才声明 scope。once 类选项不生成 consent,带上去也不会被读，
+    // 但显式一点，日志里也能一眼看出这次是不是永久授权。
+    if (scope) params._meta = { kiro: { consent: { scope } } };
+    return this.request('_kiro/permission/respond', params, timeoutMs);
   }
   cancel(sessionId) {
     return this.notify('session/cancel', { sessionId });
