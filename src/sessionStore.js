@@ -50,6 +50,14 @@ const RUNNING_WINDOW_MS = 3 * 60 * 1000;
  */
 /** 从文件尾部回读的字节数，够覆盖最近若干个事件 */
 const TAIL_PROBE_BYTES = 16 * 1024;
+/**
+ * 查「某个授权请求有没有结局」时回读的字节数。
+ *
+ * 比 TAIL_PROBE_BYTES 大得多，因为 pending 与它的 resolved 之间可能夹着整轮工具调用；
+ * 实测有 agent 不等审批继续跑、在 pending 之后写了 1.28MB 的情况。
+ * 这个查询只在「打开会话要重放待批」和「提交失败要核对」两条冷路径上跑，不是热路径。
+ */
+const RESOLVE_PROBE_BYTES = 1024 * 1024;
 
 /** messages.jsonl 里需要投递到前端的事件类型 */
 const RENDERABLE = new Set([
@@ -606,6 +614,72 @@ class SessionStore {
       truncated,
       messages,
     };
+  }
+
+  /**
+   * 只读地查这个会话里**已经有结局**的授权请求，返回 toolCallId -> {outcome, selectedOption}。
+   *
+   * **刻意不复用 readHistory / tail —— 那两个都会把增量游标推到文件末尾。**
+   * 而「这个请求还活不活」是一次查询，绝不该有副作用：一次查询吃掉一批尚未处理的信号，
+   * 正是「电脑上批过了、手机上授权框还反复弹回来」那个 bug 的成因 ——
+   * readHistory 把游标推到末尾之后，夹在中间的 interaction_resolved 再也不会被 tail 看到，
+   * 于是那条记录永远算「未处理」，每次打开会话都被重放一次。
+   *
+   * 只读尾部窗口，所以**查不到不等于没有结局**（可能落在窗口外）。调用方要把
+   * 「查不到」当成「不确定」，不能当成「确认还活着」。
+   */
+  resolvedOutcomes(sessionId, maxBytes = RESOLVE_PROBE_BYTES) {
+    const out = new Map();
+    const dir = this.findSessionDir(sessionId);
+    if (!dir) return out;
+    const jsonl = path.join(dir, 'messages.jsonl');
+    let size = 0;
+    try {
+      size = fs.statSync(jsonl).size;
+    } catch (_) {
+      return out;
+    }
+    if (size <= 0) return out;
+
+    const readLen = Math.min(size, maxBytes);
+    let text = '';
+    let fd;
+    try {
+      fd = fs.openSync(jsonl, 'r');
+      const buf = Buffer.alloc(readLen);
+      fs.readSync(fd, buf, 0, readLen, size - readLen);
+      text = buf.toString('utf8');
+    } catch (_) {
+      return out;
+    } finally {
+      if (fd !== undefined) {
+        try {
+          fs.closeSync(fd);
+        } catch (_) {
+          /* ignore */
+        }
+      }
+    }
+
+    const lines = text.split('\n');
+    // 回读起点可能落在某行中间，丢掉首行残片
+    if (size > readLen) lines.shift();
+    for (const line of lines) {
+      if (!line.trim()) continue;
+      let ev;
+      try {
+        ev = JSON.parse(line);
+      } catch (_) {
+        continue; // 末尾可能是正在写入的半行
+      }
+      const p = ev && ev.payload;
+      if (!p || p.type !== 'interaction_resolved' || !p.toolCallId) continue;
+      out.set(p.toolCallId, {
+        outcome: p.outcome || 'resolved',
+        selectedOption: p.selectedOption || null,
+      });
+    }
+    return out;
   }
 
   /**

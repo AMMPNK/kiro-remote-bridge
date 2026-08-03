@@ -787,10 +787,32 @@ function permissionPayload(toolCallId, rec = pendingPermissions.get(toolCallId))
  */
 function pendingPermissionsFor(sessionId) {
   if (!sessionId) return [];
-  const out = [];
+  const cand = [];
   for (const [toolCallId, rec] of pendingPermissions) {
     if (!rec || rec.sessionId !== sessionId) continue;
     if (rec.resolvedAt || rec.respondedAt) continue;
+    cand.push([toolCallId, rec]);
+  }
+  if (!cand.length) return [];
+  /*
+   * 重放之前必须用文件再核对一遍。
+   *
+   * 内存里的「未处理」只说明**桥**没看到结局,不等于结局没发生 —— 人可能在电脑上批了,
+   * 而那条 interaction_resolved 恰好被跳过了:readHistory() 会把 tail 的增量游标推到
+   * 文件末尾,夹在「上次 tail」与「这次打开会话」之间写入的结局,再也不会被 tail 读到。
+   * 少了这一步的后果实测过:电脑上批完之后,手机每次打开这个会话都弹回一个早已失效的
+   * 授权框,点下去只会拿到 agent 的 -32001 No pending permission。
+   *
+   * 只在候选非空时才读文件,避免每次打开会话都白读一遍。
+   */
+  const settled = store.resolvedOutcomes(sessionId);
+  const out = [];
+  for (const [toolCallId, rec] of cand) {
+    const done = settled.get(toolCallId);
+    if (done) {
+      markPermissionResolved(toolCallId, done.outcome);
+      continue;
+    }
     const p = permissionPayload(toolCallId, rec);
     if (p) out.push(p);
   }
@@ -923,10 +945,29 @@ async function respondPermission(toolCallId, approve, wantOptionId = null) {
       await connection.respondPermission(sid, toolCallId, optionId, scope);
       log(`[approve] ★ _kiro/permission/respond 已被接受 toolCallId=${toolCallId}`);
     } catch (err) {
-      // 失败要如实说，不能让手机端以为批准了
-      rec.respondedAt = 0;
       const msg = String(err && err.message ? err.message : err);
       log(`[approve] ★ _kiro/permission/respond 失败 toolCallId=${toolCallId}: ${msg}`);
+      /*
+       * 失败之后先回头核对真实状态,再决定能不能重试。
+       *
+       * 最常见的失败原因是「这个请求已经在电脑上批过了」(agent 回
+       * -32001 No pending permission)。那种情况下重试永远不可能成功,
+       * 而把 respondedAt 清零会让这条记录继续算「还在等你」,于是每次打开会话
+       * 都重放一个死掉的授权框 —— 用户点一次失败一次。
+       *
+       * 用文件里的 interaction_resolved 判定,不去解析 agent 的错误文本:
+       * 文本随版本变,文件里的结局是确定信号。查询走 resolvedOutcomes()
+       * (只读、不动游标),不能用 readHistory,否则又会吃掉一批未处理的信号。
+       */
+      const settled = store.resolvedOutcomes(sid).get(toolCallId);
+      if (settled) {
+        markPermissionResolved(toolCallId, settled.outcome);
+        throw new Error(
+          `这个请求已经在别处处理过了（${settled.selectedOption || settled.outcome}），你这次点击没有生效。`
+        );
+      }
+      // 只有确认它还活着才允许重试。失败要如实说，不能让手机端以为批准了。
+      rec.respondedAt = 0;
       throw new Error(`提交失败：${msg}`);
     }
     // 刻意不删记录：留着才能在结局到达时对上账
@@ -1378,6 +1419,9 @@ module.exports = {
     pendingPermissionsFor,
     permissionPayload,
     buildHandlers,
+    // 测「读历史会不会吃掉未处理的结局信号」必须用扩展实际在用的这个实例，
+    // 自己新建一个 SessionStore 就测不到游标被共享的那个问题
+    getStore: () => store,
     RESOLVED_KEEP_MS,
     PERMISSION_MAX_RECORDS,
   },

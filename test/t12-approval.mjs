@@ -9,7 +9,7 @@
 import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
-import { mkdtempSync, mkdirSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync, appendFileSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import Module from 'node:module';
 
@@ -60,7 +60,7 @@ const ext = require_('./src/extension.js');
 ext.activate({ subscriptions: [], extensionPath: ROOT });
 const {
   pendingPermissions, respondPermission, markPermissionResolved, onMuxInbound,
-  pendingPermissionsFor, buildHandlers,
+  pendingPermissionsFor, buildHandlers, getStore,
 } = ext.__test;
 
 // ---------------------------------------------------------------- 假 mux 连接
@@ -414,6 +414,165 @@ const opened2 = await handlers['session:open']({ sessionId: 'sess_x' }, fakeMobi
 check('没有待处理时回空数组而不是 undefined',
   Array.isArray(opened2.pending) && opened2.pending.length === 0,
   JSON.stringify(opened2.pending));
+
+// ================================================================ 9. 电脑上批过之后，不能再把死掉的授权框重放给手机
+//
+// 实测故障：在电脑上批准了一个 fs_write，手机上那个授权框一直挂着，而且**每次重新打开
+// 会话都弹回来**，点下去只拿到 agent 的 `-32001 No pending permission`。
+//
+// 根因是一次「读」有副作用：readHistory() 会把 tail 的增量游标推到文件末尾，于是夹在
+// 「上次 tail」与「这次打开会话」之间写入的 interaction_resolved 再也不会被 tail 读到 ——
+// 而那是**唯一**能把记录标成已解决的信号来源。记录永远算「未处理」，于是无限重放。
+//
+// 这一段按真实时序复现整条链，最后断言重放入口必须自己核对文件、不能只信内存。
+{
+  const store = getStore();
+  const SID = 'sess_cursorskip';
+  const dir = join(SANDBOX, '.kiro', 'sessions', 'ws1', SID);
+  mkdirSync(dir, { recursive: true });
+  const jsonl = join(dir, 'messages.jsonl');
+  let seq = 0;
+  const line = (payload) =>
+    JSON.stringify({ id: `e${++seq}`, timestamp: new Date().toISOString(), payload }) + '\n';
+
+  // —— 只有 pending，还没有结局
+  writeFileSync(
+    jsonl,
+    line({ type: 'turn_start' }) +
+      line({
+        type: 'pending_interaction',
+        interactionType: 'tool_approval',
+        toolCallId: 'tc-cursor',
+        question: 'Write File',
+        options: REAL_OPTIONS,
+      })
+  );
+
+  pendingPermissions.clear();
+  sent = [];
+  onMuxInbound({
+    method: 'session/request_permission',
+    id: 501,
+    connection: fakeConn,
+    params: { sessionId: SID, toolCallId: 'tc-cursor', title: 'Write File', options: REAL_OPTIONS },
+  });
+  // 基线：没有结局时确实会重放（证明下面的断言有区分度，不是恒真）
+  check('未解决时会被重放（基线）', pendingPermissionsFor(SID).length === 1);
+
+  // —— 人在电脑上批了：文件里出现结局
+  appendFileSync(
+    jsonl,
+    line({
+      type: 'interaction_resolved',
+      toolCallId: 'tc-cursor',
+      outcome: 'selected',
+      selectedOption: 'accept',
+    })
+  );
+
+  // —— 复现那次「有副作用的读」：readHistory 把游标推到文件末尾
+  store.readHistory(SID, 400);
+  check('readHistory 确实把游标推到了末尾（这就是漏信号的机制）',
+    store.cursors.get(jsonl) === statSync(jsonl).size,
+    `游标=${store.cursors.get(jsonl)} 文件=${statSync(jsonl).size}`);
+  check('结局已落在游标之前，tail 再也读不到它',
+    (store.tail(SID).messages || []).every((m) => m.kind !== 'resolved'));
+
+  // —— 关键：重放入口必须自己核对文件
+  const replay = pendingPermissionsFor(SID);
+  check('★ 电脑上批过之后不再重放这条授权',
+    replay.length === 0, JSON.stringify(replay.map((p) => p.toolCallId)));
+  check('★ 记录被标成已解决（下次打开会话也不会再重放）',
+    !!(pendingPermissions.get('tc-cursor') || {}).resolvedAt);
+
+  /*
+   * 核对用的查询自己绝不能推进游标 —— 否则它就成了同一个 bug 的新来源。
+   *
+   * 必须先把游标压回文件开头才测得出来：上面几步已经把它推到末尾了,
+   * 在这个**饱和状态**下,即使 resolvedOutcomes 真的 set 一次同样的值也看不出变化。
+   * 第一版断言就是直接比较前后值,注入 `this.cursors.set(jsonl, size)` 之后测试照样全绿 ——
+   * 前置状态让被测行为不可观测。
+   */
+  store.cursors.set(jsonl, 0);
+  store.resolvedOutcomes(SID);
+  check('★ resolvedOutcomes 不推进游标（查询不能有副作用）',
+    store.cursors.get(jsonl) === 0, `游标被改成了 ${store.cursors.get(jsonl)}`);
+  check('resolvedOutcomes 能查出结局与所选选项', (() => {
+    const r = store.resolvedOutcomes(SID).get('tc-cursor');
+    return !!r && r.outcome === 'selected' && r.selectedOption === 'accept';
+  })());
+  check('resolvedOutcomes 对不存在的会话返回空表',
+    store.resolvedOutcomes('sess_nope').size === 0);
+}
+
+// ================================================================ 10. 提交失败后要核对真实状态，不能无脑允许重试
+//
+// 提交失败最常见的原因就是「已经在电脑上批过了」。那时重试永远不可能成功，
+// 而把 respondedAt 清零会让这条记录继续算「还在等你」—— 点一次失败一次。
+{
+  const store = getStore();
+  const SID = 'sess_failcheck';
+  const dir = join(SANDBOX, '.kiro', 'sessions', 'ws1', SID);
+  mkdirSync(dir, { recursive: true });
+  const jsonl = join(dir, 'messages.jsonl');
+  let seq = 0;
+  const line = (payload) =>
+    JSON.stringify({ id: `f${++seq}`, timestamp: new Date().toISOString(), payload }) + '\n';
+  writeFileSync(
+    jsonl,
+    line({ type: 'turn_start' }) +
+      line({
+        type: 'interaction_resolved',
+        toolCallId: 'tc-already',
+        outcome: 'selected',
+        selectedOption: 'always-accept',
+      })
+  );
+
+  pendingPermissions.clear();
+  sent = [];
+  onMuxInbound({
+    method: 'session/request_permission',
+    id: 502,
+    connection: fakeConn,
+    params: { sessionId: SID, toolCallId: 'tc-already', title: 'Write File', options: REAL_OPTIONS },
+  });
+
+  failNextRespond = true; // 模拟 agent 回 -32001 No pending permission
+  let err = null;
+  try {
+    await respondPermission('tc-already', true, 'accept');
+  } catch (e) {
+    err = e;
+  }
+  check('★ 提交失败但文件里已有结局 → 报「已在别处处理」而不是笼统的提交失败',
+    !!err && /已经在别处处理过/.test(err.message), err ? err.message : '没抛错');
+  check('★ 并且标成已解决，不再重放',
+    !!(pendingPermissions.get('tc-already') || {}).resolvedAt);
+  check('★ 这条不会再出现在重放列表里', pendingPermissionsFor(SID).length === 0);
+
+  // 对照：文件里没有结局时，仍然要允许重试（不能把所有失败都当成已处理）
+  onMuxInbound({
+    method: 'session/request_permission',
+    id: 503,
+    connection: fakeConn,
+    params: { sessionId: SID, toolCallId: 'tc-live', title: 'Write File', options: REAL_OPTIONS },
+  });
+  failNextRespond = true;
+  let err2 = null;
+  try {
+    await respondPermission('tc-live', true, 'accept');
+  } catch (e) {
+    err2 = e;
+  }
+  check('文件里没有结局时仍报「提交失败」并允许重试',
+    !!err2 && /提交失败/.test(err2.message) &&
+      !(pendingPermissions.get('tc-live') || {}).resolvedAt &&
+      !(pendingPermissions.get('tc-live') || {}).respondedAt,
+    err2 ? err2.message : '没抛错');
+  check('允许重试的那条仍会被重放（还在等人批）',
+    pendingPermissionsFor(SID).some((p) => p.toolCallId === 'tc-live'));
+}
 
 // ---------------------------------------------------------------- 收尾
 pendingPermissions.clear();
