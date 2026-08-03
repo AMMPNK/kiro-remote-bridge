@@ -482,8 +482,19 @@ const setShowEmpty = (v) => {
 
 /** 空会话：messages.jsonl 为 0 字节。实测这类会话标题恒为 New Session。 */
 const isEmpty = (s) => !s.bytes;
+/*
+ * HTML 转义。**引号也转** —— 这一条是刻意的，起因是一次自查：
+ * 有 7 处属性位置写的是 `data-id="${esc(x)}"`，而当时 esc 只转 & < >，不转引号。
+ * 那些值当时都不是外部可控的自由文本（会话 id、时间戳、模型 id、base64 缩略图），
+ * 所以不可利用；但它依赖「上游数据格式永远不含引号」这个假设，上游一变就是注入点。
+ *
+ * 与其立规矩「属性位置必须用 escAttr」，不如让**唯一的那个函数默认就是安全的** ——
+ * 结构上不可能用错，比记得用对可靠。文本位置多转引号只是多几个实体，无副作用
+ * （已确认 esc 的结果只用于拼 HTML，没有进 textContent 的地方）。
+ */
 const esc = (s) => String(s == null ? '' : s)
-  .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+  .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
 
 /**
  * 实时状态。后端算好的 s.live 优先。

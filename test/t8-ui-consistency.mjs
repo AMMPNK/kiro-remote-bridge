@@ -182,6 +182,39 @@ check('待确认分支走 pendingCard()',
 check('pendingCard 用 optionLabels 取选项标签，而不是直接读 title',
   /function pendingCard\(m\)[\s\S]{0,900}?optionLabels\(m\.options\)/.test(script));
 
+// ---- esc() 必须转义引号
+// 起因是一次安全自查：有 7 处属性位置写成 `data-id="${esc(x)}"`，而 esc 当时只转
+// & < >。那些值当时都不可控所以没被利用，但这依赖「上游永远不含引号」的假设。
+// 修法是让 esc 默认转引号（结构上不可能用错），这里把它钉住 ——
+// 谁把引号转义删掉，属性注入面就立刻回来。
+/*
+ * 按行提取,不要用 `([\s\S]*?);` 这种「到第一个分号为止」的正则 ——
+ * HTML 实体本身带分号（`'&amp;'`），非贪婪匹配会停在那里，body 只截到一半。
+ * 第一版就是这么写的，结果 5 条断言从写出来那刻就全是红的，
+ * 而我当时直接去做注入验证、看到「全红」还以为断言有效。
+ * **教训：加了新断言先跑一遍确认基线是绿的，再注入 —— 否则「红了」证明不了任何事。**
+ */
+const escLines = script.split('\n');
+const escAt = escLines.findIndex((l) => /^const esc = /.test(l));
+let escDef = '';
+if (escAt >= 0) {
+  escDef = escLines[escAt];
+  for (let i = escAt + 1; i < escLines.length && /^\s*\.replace\(/.test(escLines[i]); i++) {
+    escDef += escLines[i];
+  }
+}
+check('esc() 存在且能被解析出来', !!escDef, `${escDef.length} 字符`);
+if (escDef) {
+  const body = escDef;
+  check('esc() 转义 <', /&lt;/.test(body));
+  check('esc() 转义 >', /&gt;/.test(body));
+  check('esc() 转义 &', /&amp;/.test(body));
+  check('★ esc() 转义双引号（属性位置的注入面）', /&quot;/.test(body));
+  check('★ esc() 转义单引号', /&#39;/.test(body));
+}
+// 属性位置用 esc 还是 escAttr 都安全了（后者只是前者的冗余包装），
+// 所以不再需要「属性必须用 escAttr」那条规矩 —— 但反过来要确保没人把 esc 改回去。
+
 // resolvedView 的配色 class 是插值出来的（class="st ${v.cls}"），前面那条
 // 「JS 生成的 class 必须在 CSS 里有定义」扫不到具体值，所以在这里逐个点名。
 // 漏一个的后果很安静：那个状态退回默认灰，「已取消」和「已拒绝」看不出区别。
