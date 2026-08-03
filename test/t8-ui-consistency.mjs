@@ -173,8 +173,22 @@ check('不渲染登记表里没有已消失的 kind', staleExempt.length === 0, 
 check('选项标签同时认 name 与 title',
   /o\.name \|\| o\.title|o\.title \|\| o\.name/.test(script),
   '应有 optionLabels 之类同时取两个字段的实现');
-check('待确认卡片走 optionLabels 而不是直接取 title',
-  /case 'pending':[\s\S]{0,400}?optionLabels\(m\.options\)/.test(script));
+// 这条原来写成「case 'pending': 之后 400 字符内出现 optionLabels」。
+// 授权卡片的分支变多（待确认 / 已允许 / 已拒绝 / 已取消）后渲染抽成了 pendingCard()，
+// 那个断言立刻失败 —— 而功能是好的。**按字符距离的断言一重构就报假故障**，
+// 且报出来的样子像是功能坏了。换成两条各自独立的结构断言。
+check('待确认分支走 pendingCard()',
+  /case 'pending':\s*return pendingCard\(m\)/.test(script));
+check('pendingCard 用 optionLabels 取选项标签，而不是直接读 title',
+  /function pendingCard\(m\)[\s\S]{0,900}?optionLabels\(m\.options\)/.test(script));
+
+// resolvedView 的配色 class 是插值出来的（class="st ${v.cls}"），前面那条
+// 「JS 生成的 class 必须在 CSS 里有定义」扫不到具体值，所以在这里逐个点名。
+// 漏一个的后果很安静：那个状态退回默认灰，「已取消」和「已拒绝」看不出区别。
+const stClasses = ['approved', 'denied', 'cancelled'];
+const missingSt = stClasses.filter((c) => !new RegExp(`\\.st\\.${c}\\b`).test(style));
+check('审批结局的三种配色 class 都在 CSS 里有定义', missingSt.length === 0,
+  missingSt.length ? `缺: ${missingSt.join(', ')}` : stClasses.join(' / '));
 
 // ---- 9d. 授权框的按钮必须由 options 生成，不能写死两个
 // 实测：只给「允许 / 拒绝」时用户无法知道自己批的是单次还是永久，而 allow_once 与

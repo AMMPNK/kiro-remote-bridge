@@ -180,6 +180,9 @@
     min-width:0;flex:1}
   .tool .st{flex:0 0 auto;font-size:10px;color:var(--faint)}
   .tool .st.failed,.tool .st.denied{color:var(--red)}
+  .tool .st.approved{color:var(--green)}
+  /* 与默认灰同色，但显式写出来：「已取消」是中性结局，不该跟「已拒绝」一样刺眼 */
+  .tool .st.cancelled{color:var(--faint)}
   .tool .bd{display:none;padding:0 11px 10px;font-size:11.5px;color:var(--dim);
     font-family:ui-monospace,SFMono-Regular,monospace;white-space:pre-wrap;
     word-break:break-all;border-top:1px solid var(--line);padding-top:9px;margin-top:0}
@@ -426,7 +429,7 @@ const WS_URL = (location.protocol === 'https:' ? 'wss://' : 'ws://') +
 // ---------------------------------------------------------------- 状态
 const el = (id) => document.getElementById(id);
 const mainEl = el('main'), dotEl = el('dot'), titleEl = el('title'), subEl = el('sub');
-let ws = null, reconnectDelay = 800, reqSeq = 1, failStreak = 0;
+let ws = null, reconnectDelay = 800, reqSeq = 1, failStreak = 0, reconnectTimer = null;
 /**
  * 顶栏那个点表示的是**连接状态**，agent 忙闲只是它的修饰。
  *
@@ -1008,10 +1011,7 @@ function nodeFor(m) {
     case 'toolResult':
       return m.success ? '' : `<div class="err">工具失败：${esc(m.preview)}</div>`;
     case 'pending':
-      return `<div class="tool"><div class="hd"><span class="caret">▶</span>
-        <span class="nm">⏸ 待确认</span>
-        <span class="ex">${esc(m.question || '')}</span></div>
-        <div class="bd">${esc(optionLabels(m.options))}</div></div>`;
+      return pendingCard(m);
     case 'resolved':
       return `<div class="sys">已确认：${esc(m.selectedOption || m.outcome)}</div>`;
     case 'turnEnd':
@@ -1038,8 +1038,10 @@ function bindTools(scope) {
 }
 
 function renderHistory(msgs, truncated) {
+  // 先把审批结局并进对应的待确认卡片，否则会出现「⏸ 待确认」卡片 +「已确认」一行并存
+  const items = mergeResolved(msgs);
   mainEl.innerHTML = (truncated ? '<div class="divider">仅显示最近部分</div>' : '') +
-    (msgs.map(nodeFor).join('') || '<div class="empty">这个会话还没有内容</div>');
+    (items.map(nodeFor).join('') || '<div class="empty">这个会话还没有内容</div>');
   // 历史里的思考全部已经结束，一律收起
   settleThinking(mainEl, false);
   bindTools(mainEl);
@@ -1048,6 +1050,12 @@ function renderHistory(msgs, truncated) {
 
 function appendDelta(msgs) {
   reconcilePending(msgs);
+  /*
+   * 结局到达时先去更新那张已经渲染好的授权卡片；更新成功的就不再作为新消息追加 ——
+   * 否则卡片下面会多出一行「已确认：xxx」，而卡片本身还写着「待确认」。
+   * 与 mergeResolved() 互补：那个管整批渲染（打开会话），这个管人正看着时的增量。
+   */
+  msgs = (msgs || []).filter((m) => !markPendingResolvedInDom(m));
   // turnEnd 是回合结束的确定信号，比列表推送早、也比它可靠
   if (msgs.some((m) => m.kind === 'turnEnd')) setTurnActive(false);
   // tail 带来了权威内容（思考或正文），或回合已结束 → 撤掉实时占位，避免同一段出现两遍。
@@ -1180,6 +1188,114 @@ function optionTone(o) {
   return '';
 }
 
+/** 在 options 里按 optionId 找回那个选项对象（历史卡片要显示用户当时点了哪个） */
+function optionOf(optionId, options) {
+  return (Array.isArray(options) ? options : []).find((o) => o && o.optionId === optionId) || null;
+}
+
+/**
+ * 历史里的授权卡片：待确认 / 已允许 / 已拒绝 / 已取消。
+ *
+ * 会话文件里 `pending_interaction` 和 `interaction_resolved` 是两条独立记录,
+ * 后端也照原样送两条过来。**各渲染一次的结果是自相矛盾的**:一张写着「⏸ 待确认」
+ * 的卡片,下面紧跟一行「已确认:always-accept」—— 而用户第一眼看到的是那张
+ * 仍然写着待确认的卡片,会以为审批没生效。结局由 mergeResolved() 合并进 m.resolved。
+ *
+ * 选了哪个选项必须写出来:allow_once 和 allow_always 的后果差很多,
+ * 事后只显示「已允许」是不够的。
+ */
+function resolvedView(r, options) {
+  if (!r) return { icon: '⏸', word: '待确认', cls: '', pick: '' };
+  if (r.outcome !== 'selected') {
+    // 没选任何选项就有了结局:被取消或超时。批准没落地,不能显示成已允许。
+    return { icon: '⊘', word: '已取消', cls: 'cancelled', pick: r.outcome || '' };
+  }
+  // options 拿不到时(增量更新路径)退回用 optionId 判断,optionTone 两个字段都看
+  const opt = optionOf(r.selectedOption, options) || { optionId: r.selectedOption };
+  const no = optionTone(opt) === 'no';
+  return {
+    icon: no ? '✗' : '✓',
+    word: no ? '已拒绝' : '已允许',
+    cls: no ? 'denied' : 'approved',
+    pick: opt.name || opt.title || opt.optionId || '',
+  };
+}
+
+function pendingCard(m) {
+  const v = resolvedView(m.resolved, m.options);
+  const st = m.resolved ? `<span class="st ${v.cls}">${esc(v.pick)}</span>` : '';
+  // data-pending 让增量到达的结局能直接更新这张已经渲染好的卡片
+  return `<div class="tool" data-pending="${escAttr(m.toolCallId || '')}">
+      <div class="hd"><span class="caret">▶</span>
+        <span class="nm">${v.icon} ${v.word}</span>
+        <span class="ex">${esc(m.question || '')}</span>${st}</div>
+      <div class="bd">${esc(optionLabels(m.options))}</div>
+    </div>`;
+}
+
+/**
+ * 把 interaction_resolved 的结局并进对应的 pending 记录,并去掉已合并的那条独立记录。
+ *
+ * 没找到对应 pending 的 resolved **保留**:历史可能只截取了尾部窗口,
+ * pending 落在窗口外。那时丢掉 resolved 会让这次审批彻底看不见。
+ */
+function mergeResolved(msgs) {
+  if (!Array.isArray(msgs)) return msgs;
+  const byId = new Map();
+  for (const m of msgs) {
+    if (m && m.kind === 'resolved' && m.toolCallId) byId.set(m.toolCallId, m);
+  }
+  if (!byId.size) return msgs;
+  const merged = [];
+  const consumed = new Set();
+  for (const m of msgs) {
+    if (m && m.kind === 'pending' && m.toolCallId && byId.has(m.toolCallId)) {
+      const r = byId.get(m.toolCallId);
+      consumed.add(m.toolCallId);
+      merged.push({
+        ...m,
+        resolved: { outcome: r.outcome, selectedOption: r.selectedOption, ts: r.ts },
+      });
+      continue;
+    }
+    merged.push(m);
+  }
+  return merged.filter(
+    (m) => !(m && m.kind === 'resolved' && m.toolCallId && consumed.has(m.toolCallId))
+  );
+}
+
+/**
+ * 结局在增量里到达时,直接更新那张已经渲染好的卡片。
+ *
+ * 不能只靠 mergeResolved:它作用于整批渲染,而人正看着会话时结局是通过 delta 来的,
+ * 此时卡片已经在 DOM 里。不更新的话,要等下一次重新打开会话才会变 ——
+ * 而那正是用户看到「批完了还写着待确认」的时刻。
+ */
+function markPendingResolvedInDom(m) {
+  if (!m || m.kind !== 'resolved' || !m.toolCallId) return false;
+  const card = mainEl.querySelector(`.tool[data-pending="${cssAttrEscape(m.toolCallId)}"]`);
+  if (!card) return false;
+  const hd = card.querySelector('.hd');
+  const nm = card.querySelector('.nm');
+  if (!hd || !nm) return false;
+  const v = resolvedView({ outcome: m.outcome, selectedOption: m.selectedOption });
+  nm.textContent = `${v.icon} ${v.word}`;
+  let st = card.querySelector('.st');
+  if (!st) {
+    st = document.createElement('span');
+    hd.appendChild(st);
+  }
+  st.className = `st ${v.cls}`;
+  st.textContent = v.pick;
+  return true;
+}
+
+/** 属性选择器里的转义。toolCallId 由 agent 给出,不能假定它一定不含引号。 */
+function cssAttrEscape(s) {
+  return String(s).replace(/["\\]/g, '\\$&');
+}
+
 function showPending(p, notify = true) {
   pendingItem = p;
   el('pq').textContent = [p.title, p.detail].filter(Boolean).join('\n') || '需要确认';
@@ -1269,6 +1385,37 @@ async function probeAuth() {
   } catch (_) { return 0; }
 }
 
+/** 排一次重连。同一时刻只保留一个待执行的重连，避免多个定时器同时醒来连出几条。 */
+function scheduleReconnect(delay) {
+  if (reconnectTimer) clearTimeout(reconnectTimer);
+  reconnectTimer = setTimeout(() => {
+    reconnectTimer = null;
+    connect();
+  }, delay);
+}
+
+/**
+ * 立刻确保连接可用。
+ *
+ * 为什么不能只靠 setTimeout：**手机锁屏后浏览器会冻结后台页面的定时器**，
+ * 解锁回来时那个 setTimeout 不一定恢复执行，页面就永远停在「已断开，重连中…」。
+ * 实测正是如此 —— 停在那一页不动就一直不恢复，而返回上级页面再切回来就好了，
+ * 因为那些交互让浏览器把页面完全唤醒，冻着的定时器才继续跑。
+ *
+ * 所以要在「页面重新可见」和「网络恢复」这两个**确定信号**上主动连一次，
+ * 并把退避重置：人刚回到页面时还要等 8 秒才重连是没道理的。
+ */
+function ensureConnected() {
+  // 0=CONNECTING 1=OPEN，这两种状态下不要再开一条
+  if (ws && (ws.readyState === 0 || ws.readyState === 1)) return;
+  reconnectDelay = 800;
+  if (reconnectTimer) {
+    clearTimeout(reconnectTimer);
+    reconnectTimer = null;
+  }
+  connect();
+}
+
 function connect() {
   if (!TOKEN) {
     showBlocker('缺少访问凭证',
@@ -1279,8 +1426,29 @@ function connect() {
   ws.onopen = () => {
     reconnectDelay = 800;
     failStreak = 0;
+    if (reconnectTimer) {
+      clearTimeout(reconnectTimer);
+      reconnectTimer = null;
+    }
     connected = true;
     paintDot();
+    /*
+     * 重连后必须重新发一次 session:open。
+     *
+     * 后端把「这台手机在看哪个会话」记在**连接**上（watchedSessionId），连接一断
+     * 这份记账就没了。只恢复 WebSocket 的话，点会变绿，但 delta / muxUpdate /
+     * 待批重放都不会来 —— 看起来是连上了，内容却不动，比断开更容易误判。
+     * 这也是待批授权框在重连后回来的那条路（session:open 会带回 pending）。
+     *
+     * 顺便把副标题从「已断开，重连中…」恢复成本来的内容：它和连接提示共用一个位置。
+     */
+    if (view === 'chat' && openId) {
+      const s = sessions.find((x) => x.sessionId === openId);
+      subEl.textContent = s ? `${s.workspaceName} · ${shortModel(s.modelId) || 'default'}` : '';
+      send('session:open', { sessionId: openId, limit: 400 });
+    } else if (view === 'list') {
+      renderList(true);
+    }
   };
   ws.onclose = async () => {
     connected = false;
@@ -1293,7 +1461,7 @@ function connect() {
     }
     subEl.textContent = `已断开，重连中…（第 ${failStreak} 次）`;
     subEl.classList.remove('hide');
-    setTimeout(connect, reconnectDelay);
+    scheduleReconnect(reconnectDelay);
     reconnectDelay = Math.min(reconnectDelay * 1.6, 8000);
   };
   ws.onerror = () => {};
@@ -1742,6 +1910,17 @@ sendBtn.onclick = () => {
   renderAtts();
   syncSendState();
 };
+
+/*
+ * 锁屏、切到别的 App、网络切换之后回来时，重连定时器可能已经被浏览器冻结、不会自己醒。
+ * 这几个事件是「人回来了 / 网络回来了」的确定信号，比等定时器可靠。
+ * pageshow 是给 iOS Safari 兜底：它从后台恢复时不一定触发 visibilitychange。
+ */
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible') ensureConnected();
+});
+window.addEventListener('online', () => ensureConnected());
+window.addEventListener('pageshow', () => ensureConnected());
 
 connect();
 </script>

@@ -211,5 +211,165 @@ const btnIds = (h) => h.els.pacts.buttons.map((b) => b.dataset.opt);
   check('带上 toolCallId', last && last.payload.toolCallId === 'tc-1', last && last.payload.toolCallId);
 }
 
+// ================================================================ 8. 审批结局要并进那张卡片
+//
+// 实测问题：手机上批准后，历史里那张卡片仍写着「⏸ 待确认」，下面另起一行「已确认：
+// always-accept」。会话文件里 pending_interaction 和 interaction_resolved 本来就是
+// 两条记录，后端照原样送来，前端各渲染一次 —— 两条都对，合起来自相矛盾，
+// 而用户第一眼看的是那张写着「待确认」的卡片，会以为审批没生效。
+function buildCardHarness() {
+  const src = [
+    extractFn(script, 'optionTone'),
+    extractFn(script, 'optionOf'),
+    extractFn(script, 'optionLabels'),
+    extractFn(script, 'resolvedView'),
+    extractFn(script, 'pendingCard'),
+    extractFn(script, 'mergeResolved'),
+    'return { resolvedView, pendingCard, mergeResolved, optionOf, optionLabels };',
+  ].join('\n');
+  return new Function('esc', 'escAttr', src)(
+    (s) => String(s == null ? '' : s),
+    (s) => String(s == null ? '' : s).replace(/"/g, '&quot;')
+  );
+}
+
+{
+  const h = buildCardHarness();
+  const O = OPTIONS;
+
+  check('没有结局 → 待确认', h.resolvedView(null).word === '待确认');
+
+  const allow = h.resolvedView({ outcome: 'selected', selectedOption: 'always-accept' }, O);
+  check('选了 always-accept → 已允许 + 绿',
+    allow.word === '已允许' && allow.cls === 'approved', `${allow.word}/${allow.cls}`);
+  // 只显示「已允许」是不够的：allow_once 和 allow_always 的后果差很多
+  check('写出用户当时选的是哪个', allow.pick === 'Always allow', allow.pick);
+
+  const deny = h.resolvedView({ outcome: 'selected', selectedOption: 'reject' }, O);
+  check('选了 reject → 已拒绝 + 红',
+    deny.word === '已拒绝' && deny.cls === 'denied', `${deny.word}/${deny.cls}`);
+
+  // 关键区分：没选任何选项就有结局 = 被取消/超时，批准并没有落地
+  const cancel = h.resolvedView({ outcome: 'cancelled' }, O);
+  check('outcome=cancelled → 已取消，不能显示成已允许',
+    cancel.word === '已取消' && cancel.cls === 'cancelled', `${cancel.word}/${cancel.cls}`);
+
+  // 增量更新那条路拿不到 options，只能靠 optionId 判
+  const noOpts = h.resolvedView({ outcome: 'selected', selectedOption: 'always-accept' });
+  check('拿不到 options 时仍按 optionId 判出已允许', noOpts.word === '已允许', noOpts.word);
+
+  const pend = h.pendingCard({ kind: 'pending', toolCallId: 'tc-1', question: 'q', options: O });
+  check('待确认卡片显示 ⏸ 待确认', /⏸ 待确认/.test(pend));
+  check('待确认卡片不带状态标签', !/class="st /.test(pend));
+  check('卡片带 data-pending，供增量更新定位', /data-pending="tc-1"/.test(pend));
+
+  const done = h.pendingCard({
+    kind: 'pending', toolCallId: 'tc-1', question: 'q', options: O,
+    resolved: { outcome: 'selected', selectedOption: 'always-accept' },
+  });
+  check('★ 已批准的卡片不再出现「待确认」字样', !/待确认/.test(done));
+  check('★ 已批准的卡片显示 ✓ 已允许', /✓ 已允许/.test(done));
+  check('已批准的卡片带 approved 配色', /class="st approved"/.test(done));
+  check('已批准的卡片写出 Always allow', /Always allow/.test(done));
+
+  const merged = h.mergeResolved([
+    { kind: 'message', role: 'user' },
+    { kind: 'pending', toolCallId: 'tc-1', options: O },
+    { kind: 'resolved', toolCallId: 'tc-1', outcome: 'selected', selectedOption: 'accept' },
+  ]);
+  check('★ 结局并进 pending 记录',
+    merged.some((m) => m.kind === 'pending' && m.resolved && m.resolved.selectedOption === 'accept'));
+  check('★ 已合并的 resolved 不再单独占一条',
+    !merged.some((m) => m.kind === 'resolved'), `合并后 ${merged.length} 条`);
+  check('其他消息不受影响', merged.filter((m) => m.kind === 'message').length === 1);
+
+  // 历史只截取尾部窗口时，pending 可能落在窗口外 —— 那时丢掉 resolved
+  // 会让这次审批彻底看不见
+  const orphan = h.mergeResolved([
+    { kind: 'resolved', toolCallId: 'tc-x', outcome: 'selected', selectedOption: 'accept' },
+  ]);
+  check('找不到对应 pending 的结局仍然保留',
+    orphan.length === 1 && orphan[0].kind === 'resolved');
+
+  const multi = h.mergeResolved([
+    { kind: 'pending', toolCallId: 'a', options: O },
+    { kind: 'pending', toolCallId: 'b', options: O },
+    { kind: 'resolved', toolCallId: 'b', outcome: 'selected', selectedOption: 'reject' },
+  ]);
+  check('只合并有结局的那条，另一条仍是待确认',
+    multi.find((m) => m.toolCallId === 'a').resolved === undefined &&
+      multi.find((m) => m.toolCallId === 'b').resolved.selectedOption === 'reject');
+  check('没有 resolved 时原样返回', h.mergeResolved([{ kind: 'pending', toolCallId: 'z' }]).length === 1);
+}
+
+// ================================================================ 9. 结局在增量里到达时更新已渲染的卡片
+//
+// mergeResolved 只作用于整批渲染。人正看着会话时结局是通过 delta 来的，
+// 卡片已经在 DOM 里 —— 不更新就要等重新打开会话才变，而那正是
+// 「批完了状态没变」的现象。
+function buildDomHarness() {
+  const nm = { textContent: '⏸ 待确认' };
+  const st = { className: '', textContent: '' };
+  const hd = { appended: [], appendChild(x) { hd.appended.push(x); } };
+  const card = {
+    querySelector: (sel) => (sel === '.hd' ? hd : sel === '.nm' ? nm : null),
+  };
+  const mainElStub = {
+    querySelector: (sel) => (/data-pending="tc-1"/.test(sel) ? card : null),
+  };
+  const src = [
+    extractFn(script, 'optionTone'),
+    extractFn(script, 'optionOf'),
+    extractFn(script, 'resolvedView'),
+    extractFn(script, 'cssAttrEscape'),
+    extractFn(script, 'markPendingResolvedInDom'),
+    'return { markPendingResolvedInDom };',
+  ].join('\n');
+  const api = new Function('mainEl', 'document', src)(mainElStub, { createElement: () => st });
+  return { ...api, nm, st, hd };
+}
+
+{
+  const h = buildDomHarness();
+  const ok = h.markPendingResolvedInDom({
+    kind: 'resolved', toolCallId: 'tc-1', outcome: 'selected', selectedOption: 'always-accept',
+  });
+  check('★ 增量结局能更新已渲染的卡片', ok === true);
+  check('★ 卡片文案从待确认改成已允许', h.nm.textContent === '✓ 已允许', h.nm.textContent);
+  check('状态标签带 approved 配色', /approved/.test(h.st.className), h.st.className);
+  check('状态标签写出选的是哪个', h.st.textContent === 'always-accept', h.st.textContent);
+  check('新建的状态标签被挂进卡片头部', h.hd.appended.length === 1);
+  // 人在列表页时卡片不在 DOM 里，此时要返回 false，让它按普通新消息追加
+  check('卡片不在 DOM 里时返回 false',
+    h.markPendingResolvedInDom({ kind: 'resolved', toolCallId: 'other', outcome: 'selected' }) === false);
+  check('非 resolved 消息不动它', h.markPendingResolvedInDom({ kind: 'message' }) === false);
+  check('缺 toolCallId 的不动它', h.markPendingResolvedInDom({ kind: 'resolved' }) === false);
+}
+
+// ================================================================ 10. 断线重连不能只靠定时器
+//
+// 实测：手机锁屏一段时间再打开，页面停在「已断开，重连中…」永远不恢复；
+// 只有重进 URL 或返回上级再切回来才好。原因是重连只有 setTimeout 一条路，
+// 而移动浏览器会冻结后台页面的定时器，解锁后它不一定醒。
+// 这里只做静态断言：状态机在 stub 里跑不出「浏览器冻结定时器」这个前提。
+{
+  check('★ 监听 visibilitychange，页面回到前台就立刻重连',
+    /addEventListener\('visibilitychange'[\s\S]{0,200}?ensureConnected\(\)/.test(script));
+  check('★ 监听 online，网络恢复就立刻重连',
+    /addEventListener\('online'[\s\S]{0,120}?ensureConnected\(\)/.test(script));
+  check('pageshow 兜底（iOS 从后台恢复不一定触发 visibilitychange）',
+    /addEventListener\('pageshow'[\s\S]{0,120}?ensureConnected\(\)/.test(script));
+  check('ensureConnected 在已连接/正在连接时不再开一条',
+    /function ensureConnected\(\)[\s\S]{0,400}?readyState === 0 \|\| ws\.readyState === 1/.test(script));
+  check('ensureConnected 重置退避（刚回到页面不该再等 8 秒）',
+    /function ensureConnected\(\)[\s\S]{0,400}?reconnectDelay = 800/.test(script));
+  check('重连排程只保留一个定时器',
+    /function scheduleReconnect\([\s\S]{0,200}?clearTimeout\(reconnectTimer\)/.test(script));
+  // 重连后如果不重新 session:open，后端那份「这台手机在看哪个会话」的记账就是空的：
+  // 点变绿但 delta / 待批重放都不来，比断开更容易误判成正常
+  check('★ 重连成功后重新订阅当前会话',
+    /ws\.onopen[\s\S]{0,900}?send\('session:open'/.test(script));
+}
+
 console.log(`\n结果: ${pass} 通过 / ${fail} 失败`);
 process.exit(fail ? 1 : 0);
