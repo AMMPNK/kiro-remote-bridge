@@ -58,7 +58,10 @@ globalThis.__FAKE_VSCODE__ = fakeVscode;
 
 const ext = require_('./src/extension.js');
 ext.activate({ subscriptions: [], extensionPath: ROOT });
-const { pendingPermissions, respondPermission, markPermissionResolved, onMuxInbound } = ext.__test;
+const {
+  pendingPermissions, respondPermission, markPermissionResolved, onMuxInbound,
+  pendingPermissionsFor, buildHandlers,
+} = ext.__test;
 
 // ---------------------------------------------------------------- 假 mux 连接
 /** 记录 bridge 回给 agent 的东西 */
@@ -333,6 +336,84 @@ check('缺 sessionId 时显式失败而不是发一个不完整的请求',
 // ================================================================ 7. 任何失败都不退化成整批批准
 check('全过程没有触发 runOrAcceptAll',
   !executed.includes('kiroAgent.execution.runOrAcceptAll'), executed.join(','));
+
+// ================================================================ 8. 手机断线重连后要能重新拿到未处理的授权
+//
+// 实测暴露的问题：手机连接断了、重新打开页面，会话里那条授权请求只剩一张从历史文件
+// 读出来的「待确认」卡片，四个选项是纯文本，没有任何能点的按钮。
+//
+// 根因不是超时 —— 请求在桥的内存表里还活着。是没人再把它推过去：
+//   1. type:'permission' 只在请求到达那一刻广播一次
+//   2. __onConnect 只推 hello / sessions / status
+//   3. session:open 里的 subscribeSession 依赖 Kiro 上游 resendPendingPermissions()，
+//      而它只在「此前未订阅」时补发。手机断线时桥进程没死、订阅还在，所以不补发。
+// 三条路同时不通，于是审批永远回不来。
+pendingPermissions.clear();
+sent = [];
+incoming('tc-r1', 201);
+incoming('tc-r2', 202);
+
+const forSess = pendingPermissionsFor('sess_x');
+check('未处理的授权能按会话取出来', forSess.length === 2, `拿到 ${forSess.length} 条`);
+// 下面几个字段此前只在 broadcast 里现算、没存进记录。不存的话重放出来的框标题是
+// undefined、options 是 undefined —— 框能弹但一个按钮都没有，等于白重放。
+check('重放数据带 toolCallId', forSess.every((p) => p.toolCallId),
+  JSON.stringify(forSess.map((p) => p.toolCallId)));
+check('重放数据带标题', forSess.every((p) => p.title === 'feishu-mcp-pro/app_scopes'),
+  JSON.stringify(forSess.map((p) => p.title)));
+check('重放数据带四个选项',
+  forSess.every((p) => Array.isArray(p.options) && p.options.length === 4),
+  JSON.stringify(forSess.map((p) => (p.options || []).length)));
+check('重放数据带 detail',
+  forSess.every((p) => typeof p.detail === 'string' && p.detail.length > 0));
+check('重放数据带到达时间', forSess.every((p) => typeof p.at === 'number' && p.at > 0));
+check('按到达顺序排',
+  forSess[0].toolCallId === 'tc-r1' && forSess[1].toolCallId === 'tc-r2',
+  forSess.map((p) => p.toolCallId).join(','));
+check('别的会话取不到', pendingPermissionsFor('sess_other').length === 0);
+check('不传 sessionId 取不到', pendingPermissionsFor('').length === 0);
+
+// 已经批过、正在等结局的不能再弹 —— 再弹一次用户点了只会拿到「刚刚已经批过了」，
+// 那是我们自己造出来的假故障
+await respondPermission('tc-r1', true, 'accept');
+const afterRespond = pendingPermissionsFor('sess_x');
+check('已提交响应的不再重放',
+  afterRespond.length === 1 && afterRespond[0].toolCallId === 'tc-r2',
+  afterRespond.map((p) => p.toolCallId).join(','));
+
+markPermissionResolved('tc-r2', 'cancelled');
+check('已有结局的不再重放', pendingPermissionsFor('sess_x').length === 0);
+
+// ---- 端到端：走手机真正用的那个入口（session:open），不只测内部函数
+pendingPermissions.clear();
+incoming('tc-r3', 203);
+const handlers = buildHandlers();
+const fakeMobileConn = { watchedSessionId: null, sendJson() {} };
+const opened = await handlers['session:open']({ sessionId: 'sess_x' }, fakeMobileConn);
+check('session:open 回的仍是 history', opened && opened.type === 'history', opened && opened.type);
+check('session:open 带回未处理的授权（重连后框能重建）',
+  Array.isArray(opened.pending) && opened.pending.length === 1 &&
+    opened.pending[0].toolCallId === 'tc-r3',
+  JSON.stringify((opened.pending || []).map((p) => p.toolCallId)));
+check('重连拿回的授权带得出四个可点选项',
+  !!(opened.pending && opened.pending[0]) &&
+    ['accept', 'always-accept', 'reject', 'always-reject'].every((id) =>
+      (opened.pending[0].options || []).some((o) => o.optionId === id)),
+  JSON.stringify((opened.pending && opened.pending[0] && opened.pending[0].options) || []));
+// 重放的东西必须真能批下去，不能只是长得对
+sent = [];
+const rReplay = await respondPermission(opened.pending[0].toolCallId, true, 'accept');
+check('重放拿到的 toolCallId 能真的批下去',
+  rReplay && rReplay.via === 'mux' &&
+    sent.some((s) => s.kind === 'extMethod' && s.toolCallId === 'tc-r3'),
+  JSON.stringify(sent));
+
+// 没有待处理时也要给空数组：前端要能无条件用它覆盖自己的队列
+pendingPermissions.clear();
+const opened2 = await handlers['session:open']({ sessionId: 'sess_x' }, fakeMobileConn);
+check('没有待处理时回空数组而不是 undefined',
+  Array.isArray(opened2.pending) && opened2.pending.length === 0,
+  JSON.stringify(opened2.pending));
 
 // ---------------------------------------------------------------- 收尾
 pendingPermissions.clear();

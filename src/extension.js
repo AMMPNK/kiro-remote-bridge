@@ -166,7 +166,16 @@ function buildHandlers() {
       // 「待确认」历史卡片，没有按钮），流式思维链也不会有。
       subscribeSession(sessionId);
       const h = store.readHistory(sessionId, Number(msg.limit) || 400);
-      return { type: 'history', ...h };
+      // 未处理的授权请求跟历史**同一条消息**回去：顺序天然确定，手机端渲染完历史
+      // 就能把框弹出来。分两条消息发的话，框可能先到、被随后的历史渲染盖住。
+      const pending = pendingPermissionsFor(sessionId);
+      if (pending.length) {
+        log(
+          `[approve] session:open 重放 ${pending.length} 条未处理授权 sessionId=${sessionId} ` +
+            `toolCallId=${pending.map((p) => p.toolCallId).join(',')}`
+        );
+      }
+      return { type: 'history', ...h, pending };
     },
 
     'session:send': async (msg) => {
@@ -743,6 +752,52 @@ function markPermissionResolved(toolCallId, outcome) {
 }
 
 /**
+ * 推给手机端的授权框数据。
+ *
+ * 首发（请求刚到）与重放（手机重连后补发）共用这一个函数 —— 否则两处各拼一份字段，
+ * 迟早会对不上，而对不上的表现是「重连后的框少了点什么」这种很难查的问题。
+ */
+function permissionPayload(toolCallId, rec = pendingPermissions.get(toolCallId)) {
+  if (!rec) return null;
+  return {
+    toolCallId,
+    title: rec.title,
+    detail: rec.detail,
+    options: rec.options,
+    // 手机端用它排序，也用来显示「已经等了多久」
+    at: rec.at,
+  };
+}
+
+/**
+ * 某个会话里**还在等人点**的授权请求，按到达顺序。
+ *
+ * 为什么需要它：手机刷新或断线重连是一个全新的页面上下文，授权框的状态归零，
+ * 而请求本身还在这张表里活着。此前重连后没有任何东西会把它再推一次 ——
+ * 用户看到的是一张从历史文件读出来的「待确认」卡片，没有按钮，
+ * 表面上像是已经超时作废，其实只是没人再送过去。
+ *
+ * 与 subscribeSession() 里那条 Kiro 上游补发是**互补**的两条路，都要留：
+ *   - 桥重启：内存表空了，靠 Kiro 的 resendPendingPermissions() 重新送来
+ *   - 桥活着、只是手机断线：Kiro 认为「此前已订阅」不会补发，只能靠这里
+ * 少了任何一条都会留下一类批不动的场景。
+ *
+ * 已 respondedAt 的刻意排除：它在等 agent 给结局，再弹一次只会让用户重复点，
+ * 然后拿到「刚刚已经批过了」的报错 —— 那是个我们自己造出来的假故障。
+ */
+function pendingPermissionsFor(sessionId) {
+  if (!sessionId) return [];
+  const out = [];
+  for (const [toolCallId, rec] of pendingPermissions) {
+    if (!rec || rec.sessionId !== sessionId) continue;
+    if (rec.resolvedAt || rec.respondedAt) continue;
+    const p = permissionPayload(toolCallId, rec);
+    if (p) out.push(p);
+  }
+  return out.sort((a, b) => (a.at || 0) - (b.at || 0));
+}
+
+/**
  * 回收权限请求记录。
  *
  * 只回收**已经有结局的**记录，而且要等结局产生一段时间之后 —— 留这段时间是为了让
@@ -906,6 +961,10 @@ function onMuxInbound(m) {
       // sessionId 是 _kiro/permission/respond 的必要参数，必须存下来
       sessionId: (params && params.sessionId) || null,
       at: Date.now(),
+      // title/detail 也存下来：手机断线重连后要靠它重建授权框，那时 params 早就不在
+      // 手边了。以前只在下面的 broadcast 里现算一次，于是重放无从下手。
+      title: (params && (params.title || params.toolName)) || '工具调用',
+      detail: JSON.stringify((params && params.toolCall) || params || {}).slice(0, 600),
       // 原样存下全部选项：手机端要把它们逐个显示成按钮，并回传用户点的那个 optionId。
       // 只存 allow/deny 两个推断结果是不够的 —— 四个选项里 allow_once 与 allow_always
       // 的作用范围差别很大，替用户猜一个是不对的。
@@ -914,13 +973,7 @@ function onMuxInbound(m) {
     });
     log(`[mux] 收到权限请求 toolCallId=${toolCallId} options=${JSON.stringify(options).slice(0, 200)}`);
     if (relay) {
-      relay.broadcast({
-        type: 'permission',
-        toolCallId,
-        title: (params && (params.title || params.toolName)) || '工具调用',
-        detail: JSON.stringify((params && params.toolCall) || params || {}).slice(0, 600),
-        options,
-      });
+      relay.broadcast({ type: 'permission', ...permissionPayload(toolCallId) });
     }
     return;
   }
@@ -1322,6 +1375,9 @@ module.exports = {
     respondPermission,
     markPermissionResolved,
     onMuxInbound,
+    pendingPermissionsFor,
+    permissionPayload,
+    buildHandlers,
     RESOLVED_KEEP_MS,
     PERMISSION_MAX_RECORDS,
   },

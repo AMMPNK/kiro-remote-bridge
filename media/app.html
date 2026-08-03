@@ -1129,6 +1129,30 @@ el('stop').onclick = () => {
 // ---------------------------------------------------------------- 待批准
 let pendingItem = null;
 /**
+ * 还没轮到显示的授权请求。框一次只显示一个，关掉一个自动接上下一个。
+ *
+ * 需要队列是因为重连时可能一次收到多条：同一个会话通常只有一个（agent 要等到
+ * 批准才会继续往下跑），但手机离线期间如果电脑侧也在推进，就可能攒下几条。
+ * 只弹第一条的话，用户批完它，剩下的又回到「看得到卡片点不到按钮」那个状态。
+ */
+let pendingQueue = [];
+/**
+ * 用后端送来的全量替换队列。
+ *
+ * 覆盖而不是追加：这份数据是后端那张表的当前快照，是权威的。追加会让已经消失的
+ * 请求留在队列里，用户点了只能拿到一个报错。
+ */
+function queuePending(list) {
+  const cur = pendingItem && pendingItem.toolCallId;
+  pendingQueue = (list || []).filter((p) => p && p.toolCallId && p.toolCallId !== cur);
+  if (!pendingItem) nextPending();
+}
+/** 弹出队首。队列空就什么也不做。 */
+function nextPending() {
+  const p = pendingQueue.shift();
+  if (p) showPending(p);
+}
+/**
  * 按 kind / optionId 判断某个选项是「放行」还是「拒绝」，只用来决定按钮配色。
  * 判不出来就当中性，不猜。
  */
@@ -1185,6 +1209,9 @@ function respondPending(optionId, approve) {
 function hidePending() {
   pendingItem = null;
   el('pend').classList.add('hide');
+  // 还有排队的就接上。留一点间隔，否则手指还在原位就可能误点到下一个框 ——
+  // 而下一个框里可能是个 always 选项，误点的代价不对称。
+  if (pendingQueue.length) setTimeout(nextPending, 320);
 }
 /**
  * 授权框对应的请求可能已经在 agent 侧被解决或取消了（实测：不匹配白名单的命令会在
@@ -1286,7 +1313,12 @@ function connect() {
       case 'status':
         break;
       case 'history':
-        if (m.sessionId === openId) renderHistory(m.messages || [], m.truncated);
+        if (m.sessionId === openId) {
+          renderHistory(m.messages || [], m.truncated);
+          // 断线重连后授权框要自己回来。本地状态是空的（刷新就是全新上下文），
+          // 权威数据在后端那张表里，这里跟历史一起收下。
+          if (Array.isArray(m.pending)) queuePending(m.pending);
+        }
         break;
       case 'delta':
         if (m.sessionId === openId) appendDelta(m.messages || []);
