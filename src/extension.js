@@ -1422,6 +1422,8 @@ module.exports = {
     // 测「读历史会不会吃掉未处理的结局信号」必须用扩展实际在用的这个实例，
     // 自己新建一个 SessionStore 就测不到游标被共享的那个问题
     getStore: () => store,
+    // 端到端测试要连真实的 relay：端口用 0（随机）起，只能从实例上读回来
+    getRelay: () => relay,
     RESOLVED_KEEP_MS,
     PERMISSION_MAX_RECORDS,
   },
