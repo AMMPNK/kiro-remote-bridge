@@ -1137,15 +1137,32 @@ let pendingItem = null;
  */
 let pendingQueue = [];
 /**
- * 用后端送来的全量替换队列。
+ * 用后端送来的全量重建待批状态。
  *
  * 覆盖而不是追加：这份数据是后端那张表的当前快照，是权威的。追加会让已经消失的
  * 请求留在队列里，用户点了只能拿到一个报错。
+ *
+ * **不要用 `pendingItem` 是否为空来判断「框还在显示、不用重画」。**
+ * 这两件事并不等价：renderList() 会 el('pend').classList.add('hide') 把框藏掉，
+ * 但不清 pendingItem。于是从会话返回列表再切回来时，框是 hide 状态而 pendingItem
+ * 还在，任何「已经有了就跳过」的写法都会让框再也回不来 —— 实测踩过，
+ * 表现是「退出重进 URL 能恢复，返回列表再进去不能」。
+ * 靠 showPending() 幂等来做重建，比维护一个「是否可见」的标志可靠。
  */
 function queuePending(list) {
+  const items = (list || []).filter((p) => p && p.toolCallId);
+  if (!items.length) {
+    pendingQueue = [];
+    // 后端说这个会话没有待处理的了，本地要跟上，否则会留一个点不动的框
+    if (pendingItem) hidePending();
+    return;
+  }
+  // 正在看的那条还在就继续显示它，否则从头开始
   const cur = pendingItem && pendingItem.toolCallId;
-  pendingQueue = (list || []).filter((p) => p && p.toolCallId && p.toolCallId !== cur);
-  if (!pendingItem) nextPending();
+  const head = (cur && items.find((p) => p.toolCallId === cur)) || items[0];
+  pendingQueue = items.filter((p) => p.toolCallId !== head.toolCallId);
+  // 同一条只是重画时不震动：从列表切回会话会走到这里，每次都震很烦
+  showPending(head, head.toolCallId !== cur);
 }
 /** 弹出队首。队列空就什么也不做。 */
 function nextPending() {
@@ -1163,7 +1180,7 @@ function optionTone(o) {
   return '';
 }
 
-function showPending(p) {
+function showPending(p, notify = true) {
   pendingItem = p;
   el('pq').textContent = [p.title, p.detail].filter(Boolean).join('\n') || '需要确认';
 
@@ -1192,7 +1209,7 @@ function showPending(p) {
   }
 
   el('pend').classList.remove('hide');
-  if (navigator.vibrate) navigator.vibrate([40, 60, 40]);
+  if (notify && navigator.vibrate) navigator.vibrate([40, 60, 40]);
 }
 
 /** 把用户点的那个选项发回去。optionId 为 null 时退回粗粒度的 approve 语义。 */
