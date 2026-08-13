@@ -417,9 +417,42 @@ const TOKEN_KEY = 'kiro-bridge-token';
 const qs = new URLSearchParams(location.search);
 let TOKEN = qs.get('token') || '';
 if (TOKEN) {
-  try { localStorage.setItem(TOKEN_KEY, TOKEN); } catch (_) {}
-  // 刻意保留 URL 里的 token：外壳页是否需要 token 由 relay 决定，
-  // 而 relay 的改动要等扩展重载才生效。此处抹掉会导致刷新即 401。
+  /*
+   * 存好之后把 token 从地址栏抹掉。
+   *
+   * 为什么要抹:它留在 URL 里会顺着一切带 URL 的东西外泄 —— 截图、分享链接、
+   * 浏览器历史、跨设备的历史同步。而 token 等于这台机器的命令执行权,
+   * 这个代价和它带来的便利完全不成比例。
+   *
+   * 这里原先写着「刻意保留:外壳页是否需要 token 由 relay 决定,抹掉会刷新即 401」。
+   * 那个顾虑现在已经不成立 —— relay 的 PUBLIC_PATHS 把 app.html / qr.js /
+   * manifest.json / icon.svg 都放行了(PWA 从主屏启动时 start_url 不带 query,
+   * 外壳页若要 token 会直接白屏)。实测不带 token 请求 `/` 与 `/app.html` 都是 200。
+   * 真正的门在 WebSocket 与 /api/*,它们仍然强制校验。
+   *
+   * **必须先确认真的存下来了再抹。** 只 try/catch 不够:Safari 私密浏览这类环境下
+   * setItem 可能不抛异常但也不真正保存,配额满时行为也不一致。若那时照样抹掉 URL,
+   * token 就在两个地方同时消失 —— 当前页因为内存里还有变量而看起来正常,
+   * 一刷新就得重新扫码,而且已经没有任何线索能找回它。所以回读一次做确认,
+   * 成本为零,换掉一个只在特定设备上才暴露的静默故障。
+   *
+   * replaceState 不留历史记录,所以「后退」不会退回带 token 的那一条。
+   */
+  let stored = false;
+  try {
+    localStorage.setItem(TOKEN_KEY, TOKEN);
+    stored = localStorage.getItem(TOKEN_KEY) === TOKEN;
+  } catch (_) {
+    stored = false;
+  }
+  if (stored) {
+    try {
+      const clean = location.pathname + location.hash;
+      history.replaceState(null, '', clean);
+    } catch (_) {
+      /* 某些内嵌浏览器不给 replaceState,抹不掉就算了 —— token 已经存好,功能不受影响 */
+    }
+  }
 } else {
   try { TOKEN = localStorage.getItem(TOKEN_KEY) || ''; } catch (_) {}
 }

@@ -670,36 +670,84 @@ function isSessionUnknown(err) {
   return /not found|unknown session|no such session/i.test(String((err && err.message) || err));
 }
 
+/**
+ * 判断错误是否为「该会话已有一轮 prompt 在进行中」（mux 侧的 -32002）。
+ *
+ * 为什么值得单独识别：这个错误有个反直觉的失效形态 —— **它跟电脑上那个会话
+ * 看起来忙不忙没有关系**，因为它读的是 mux 进程内存里的一个集合，不是 UI 状态。
+ *
+ * 依据（读 Kiro 产物 MultiplexStream 得到，非推测）：
+ *   进入集合：转发 session/prompt 时 activePrompts.add(sessionId)
+ *   离开集合：只有三条路
+ *     ① 我们的连接断开，且该会话再无其他订阅者，且它没有待处理的权限请求
+ *     ② 收到一次 session/cancel
+ *     ③ 那次 prompt 的正常 response 回来
+ *   没有任何超时兜底（已确认该集合前后没有 setTimeout / Date.now / expire 之类）。
+ *
+ * 所以当 response 因为连接闪断没送达、而①的两个附加条件又不满足时
+ * （最常见：那个会话正好在电脑上开着，于是「再无订阅者」不成立），
+ * 这个标记会一直悬着，之后每一次 session/prompt 都被立刻拒绝。
+ *
+ * 用户能自己解开：在电脑上对该会话点一次停止 —— 那会发 session/cancel，走②。
+ * 我们刻意不自动发 cancel：共享扩展宿主里无法区分「孤儿标记」和「另一个窗口
+ * 正在跑的真实任务」，自动取消就是误伤别人干到一半的活。
+ *
+ * 另外，这个错误是 mux 在**转发之前**拒掉的（产物里那处直接 return，没有 enqueue），
+ * 所以它属于「明确没投进去」——降级重投不会造成重复执行。
+ */
+function isPromptInFlight(err) {
+  // 先把空值挡掉：不然下面 `err.code === -32002` 那个短路会让函数返回 null 而不是
+  // false，返回值类型就不稳定了。现在的调用方都是 truthy 判断，碰不到这个问题，
+  // 但换成 === false 就会静默失效，不值得留这个坑。
+  if (!err) return false;
+  const msg = String(err.message || err);
+  return /already in-flight|already in progress/i.test(msg) || err.code === -32002;
+}
+
+/** in-flight 报错时给用户的自救说明。文案集中在一处，避免几个出口写得不一样。 */
+const IN_FLIGHT_HINT =
+  '该会话上有一轮对话还没结束，所以拒绝了新消息。' +
+  '如果电脑上这个会话其实是空闲的，那是上一轮的结束信号没送达留下的悬空标记 —— ' +
+  '在电脑上打开该会话、点一次停止即可解除。';
+
 async function sendToSession(sessionId, text, attachments) {
   const atts = Array.isArray(attachments) ? attachments : [];
   const prompt = blocksFor(text, atts);
   const wsPath = workspaceOfSession(sessionId);
   const conn = muxPool.pickForWorkspace(wsPath);
+  // mux 那一路的失败原因要留到函数末尾用：几个报错出口需要据此给出不同的解释，
+  // 特别是 in-flight —— 说成「通道不可用」会把人引去查网络和端口。
+  let lastFailure = null;
   if (conn) {
     if (atts.length) {
       const kinds = prompt.map((b) => b.type).join(',');
       log(`[send] 带 ${atts.length} 个附件 session=${sessionId} 块=${kinds}`);
     }
-    let failure = await tryPrompt(conn, sessionId, prompt);
+    lastFailure = await tryPrompt(conn, sessionId, prompt);
     // agent 不认识这个会话 → 让桌面加载一次再重试。
     // 不用 ACP 的 session/load：它要求传 mcpServers，传空数组有可能让该会话丢掉 MCP 工具，
     // 属于会静默降级的副作用；走桌面加载则用它自己的配置。
-    if (failure && isSessionUnknown(failure)) {
+    if (lastFailure && isSessionUnknown(lastFailure)) {
       log('[send] agent 不认识该会话（重启后常见），先让桌面加载一次再重试');
       await attachDesktop(sessionId);
       // viewSession 只是把面板切过去，加载是异步的；不留一点时间的话重试仍会 not found
       await new Promise((r) => setTimeout(r, ATTACH_SETTLE_MS));
-      failure = await tryPrompt(conn, sessionId, prompt);
+      lastFailure = await tryPrompt(conn, sessionId, prompt);
     }
-    if (!failure) {
+    if (!lastFailure) {
       log(`[send] via mux port=${conn.endpoint.port} session=${sessionId}`);
       return { via: 'mux' };
     }
-    log(`[send] mux 失败，降级命令: ${failure.message}`);
+    log(`[send] mux 失败，降级命令: ${lastFailure.message}`);
   }
   // 降级通道只能传纯文本。带附件时如实报错 —— 悄悄把附件丢掉再显示「已发送」，
   // 是最坏的一种失败：用户以为图发出去了，而 agent 从没见过它。
   if (atts.length) {
+    // in-flight 要单独报：说「通道不可用」会把人引到网络和端口上去查，
+    // 而真正的原因和通道无关，且有个明确的自救动作。
+    if (lastFailure && isPromptInFlight(lastFailure)) {
+      throw new Error(`${IN_FLIGHT_HINT}（带附件的消息只能走 mux，没有降级通道）`);
+    }
     throw new Error(`mux 通道不可用，带附件的消息发不出去（降级通道只支持纯文本）`);
   }
   // 降级：kiroAgent.sessions.sendPrompt(sessionId, text) 在扩展产物中确认 sessionId 有效
@@ -708,6 +756,11 @@ async function sendToSession(sessionId, text, attachments) {
     log(`[send] via command kiroAgent.sessions.sendPrompt session=${sessionId}`);
     return { via: 'command' };
   } catch (err) {
+    // 两条路都失败时，如果 mux 那边的原因是 in-flight，就把自救说明带上：
+    // 命令通道的报错通常很泛（甚至是空的），单看它查不出所以然。
+    if (lastFailure && isPromptInFlight(lastFailure)) {
+      throw new Error(`${IN_FLIGHT_HINT}（降级通道也失败了: ${(err && err.message) || '无错误信息'}）`);
+    }
     throw new Error(`发送失败（mux 与命令都不可用）: ${err && err.message}`);
   }
 }
@@ -1258,7 +1311,28 @@ async function start(context) {
     handlers: buildHandlers(),
     token: loadOrCreateToken(),
   });
-  await relay.start(port, bindLan);
+  try {
+    await relay.start(port, bindLan);
+  } catch (err) {
+    // 端口被占不等于功能不可用，这里必须把话说清楚。
+    //
+    // 多窗口时只有一个窗口能占到端口，其余窗口点「开启远程会话」都会走到这里。
+    // 而占到端口的那个 relay 会连上**全部**窗口的 mux 端点（MuxPool.refresh() 里
+    // 逐个 endpoint 连），所以所有窗口的会话在手机上都能用 —— 报原始的
+    // EADDRINUSE 会让人以为这个窗口坏了，去查防火墙和端口，方向全错。
+    relay = null;
+    if (err && err.code === 'EADDRINUSE') {
+      const msg =
+        `端口 ${port} 已被占用，本窗口不再重复开一个服务。` +
+        `通常是另一个 Kiro 窗口的 Bridge 已经在跑 —— 那一个已经覆盖了全部窗口的会话，` +
+        `手机上照常能操作本窗口的会话，不需要在这里再开。` +
+        `如果确认不是（比如被无关程序占用），改 kiroBridge.port 换一个端口。`;
+      log(`[relay] ${msg}`);
+      vscode.window.showInformationMessage(`Kiro Bridge：${msg}`);
+      return;
+    }
+    throw err;
+  }
   // 远程访问的前提是机器活着；出门在外没人能去点一下鼠标
   keepAwake();
 
