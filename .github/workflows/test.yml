@@ -23,7 +23,21 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          # 必须 >= 22.4：t14-e2e 用全局 WebSocket 当"手机端"连真 relay。
+          # 那个全局在 Node 21 才引入（要 --experimental-websocket），22.4.0 起才默认可用。
+          # 原先钉的是 '20'，于是 t14 在 CI 上 11 条全挂在 `WebSocket is not defined`，
+          # 而本地（Node 24）全绿 —— 连续 4 次红都没人看，直到收到第 5 封邮件。
+          #
+          # 选 22 是**对齐生产**，不是迁就测试：扩展实际跑在 Kiro 的扩展宿主里，
+          # 实测 Kiro 1.109.5 的宿主是 Node v22.22.0（诊断文件里的 nodeVersion 字段）。
+          # CI 比生产更旧毫无意义，而 Node 20 已经结束维护了。
+          #
+          # 已知盲区（明确记下来，不留在暗处）：这条流水线不再能发现「生产代码用了
+          # Node 22+ 才有的 API」——如果有人在更老的 Kiro 上装，扩展宿主可能是 Node 18/20。
+          # 目前 src/ 不依赖任何全局 WebSocket（已 grep 确认），没有已知的此类问题。
+          # 真要覆盖那种情况，得加 matrix 并解决「t14 在旧 Node 上合法跳过」与下面那道
+          # SKIP 白名单门禁的冲突 —— 现在没有证据说这个问题存在，不提前加复杂度。
+          node-version: '22'
 
       # 扩展本身零运行时依赖，但 t4 要拿自写的二维码编码器与 qrcode@1.5.4 逐掩码比对。
       # 那个包是 test/ref 下的可选开发依赖（gitignored），不装的话 t4 会整个 SKIP ——

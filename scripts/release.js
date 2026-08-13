@@ -36,6 +36,62 @@ const die = (msg) => {
   process.exit(1);
 };
 
+/**
+ * 报一下远端 CI 上一次跑成什么样。
+ *
+ * 为什么要有这一步：本地全绿和 CI 全绿是两件事，而这两件事**曾经连续 4 次不一致**都没被发现
+ * —— t14 用全局 WebSocket 当"手机端"，那个全局要 Node 22.4+ 才默认有，而 CI 当时钉着
+ * Node 20。本地（Node 24）永远看不到，我也从不打开 Actions 页面，最后是用户收到第 5 封
+ * 失败邮件才发现。
+ *
+ * 三条纪律，都是刻意的：
+ *   - **绝不阻断**。它是旁路观测。CI 红的时候常常正是"我这一版就是来修 CI 的"，
+ *     阻断就是误伤。观测永远不做主流程的前置条件。
+ *   - gh 不可用 / 没登录 / 没网 → 静默说一句就过，不能让发版失败在一个附加信息上。
+ *   - 报的是**上一次已完成的 run**，不是本次（本次代码还没推，CI 压根没见过它）。
+ */
+function reportCiStatus() {
+  say('看一眼远端 CI 上一次的结果（只报告，不阻断）');
+  let raw;
+  try {
+    raw = execFileSync(
+      'gh',
+      ['run', 'list', '--limit', '1', '--json', 'conclusion,headSha,displayTitle,url'],
+      { cwd: ROOT, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 15000 }
+    );
+  } catch (_) {
+    ok('查不到（gh 不可用或未登录），跳过 —— 记得自己去 Actions 看一眼');
+    return;
+  }
+  let runs = [];
+  try {
+    runs = JSON.parse(raw);
+  } catch (_) {
+    ok('gh 返回的不是预期 JSON，跳过');
+    return;
+  }
+  if (!runs.length) {
+    ok('远端还没有 run');
+    return;
+  }
+  const r = runs[0];
+  const sha = String(r.headSha || '').slice(0, 7);
+  if (r.conclusion === 'success') {
+    ok(`上一次是绿的（${sha} ${String(r.displayTitle || '').slice(0, 40)}）`);
+    return;
+  }
+  // 故意用醒目格式：这条信息被忽略过 4 次，不能再长得像普通日志。
+  console.log('');
+  console.log('  ！！ 远端 CI 上一次不是绿的 ！！');
+  console.log(`     结论: ${r.conclusion}`);
+  console.log(`     提交: ${sha} ${String(r.displayTitle || '').slice(0, 50)}`);
+  if (r.url) console.log(`     详情: ${r.url}`);
+  console.log('     本地全绿不代表 CI 全绿：环境不同（Node 版本、有没有 ~/.kiro/sessions、');
+  console.log('     装不装 test/ref 依赖）。如果这一版就是来修它的，忽略本条继续。');
+  console.log('');
+}
+reportCiStatus();
+
 // ---------------------------------------------------------------- 1. 全量测试
 say(`跑全量测试（版本 ${VERSION}）`);
 let testOut = '';
@@ -157,6 +213,8 @@ console.log('  1. 重载 Kiro 窗口（Reload Window），否则跑的还是旧�
 console.log('  2. 按 docs/manual-regression.md 走一遍人工回归');
 console.log('  3. git 提交并打 tag（脚本刻意不做，message 要人写）：');
 console.log(`       git add -p && git commit && git tag v${VERSION}`);
+console.log('  4. 推送之后确认 CI 变绿（本地全绿 ≠ CI 全绿，曾连续 4 次红没被发现）：');
+console.log('       gh run watch   # 或者去仓库的 Actions 页面看一眼');
 try {
   const dirty = execSync('git status --porcelain', { cwd: ROOT, encoding: 'utf8' }).trim();
   if (dirty) console.log(`\n  当前有 ${dirty.split('\n').length} 个文件未提交。`);
