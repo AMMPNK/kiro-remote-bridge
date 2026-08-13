@@ -56,9 +56,11 @@ const TAIL_INTERVAL_MS = 900;
  * 判定「消息已送达」的观察窗口。session/prompt 不会立刻返回，只有立即性的错误
  * （会话不存在、已有回合在跑）会在这段时间内回来。
  */
-const SEND_SETTLE_MS = 2000;
+// 用 let 只是为了让测试能把它调小（见 __test.setSettleForTest）。生产路径里它不变。
+// 不调小的话，每测一个失败场景就要真等 2 秒，测试会慢到没人愿意跑。
+let SEND_SETTLE_MS = 2000;
 /** viewSession 之后留给桌面加载会话的时间；太短会导致重试仍报 not found */
-const ATTACH_SETTLE_MS = 1500;
+let ATTACH_SETTLE_MS = 1500;
 /** 会话列表与状态的刷新间隔 */
 const LIST_INTERVAL_MS = 5000;
 
@@ -710,6 +712,46 @@ const IN_FLIGHT_HINT =
   '如果电脑上这个会话其实是空闲的，那是上一轮的结束信号没送达留下的悬空标记 —— ' +
   '在电脑上打开该会话、点一次停止即可解除。';
 
+/**
+ * 判断一个 mux 失败是否「明确没投进去」—— 只有这种情况才可以换一条路重投。
+ *
+ * 为什么需要这个判据：`tryPrompt` 只等 SEND_SETTLE_MS（2 秒）看有没有立刻报错，
+ * 但 2 秒**不足以保证 agent 还没开始干活**。如果 mux 已经把 prompt 转给 agent、
+ * agent 开始跑、然后在这 2 秒内回了个错误，那时换命令通道重投就是让同一件事做两遍
+ * —— 而 agent 干的事很多是有副作用的（改文件、跑命令），做两遍不是"多花点钱"而已。
+ *
+ * 所以判据不是「失败了没有」，而是「**投进去了没有**」。下面三类是确定没投进去的，
+ * 每一条都有依据，不是猜的：
+ *
+ *   ① connection not open —— muxClient.request() 在 ws 不是 open 时直接 reject，
+ *      压根没调 sendJson，消息没离开本进程。
+ *   ② in-flight（-32002）—— mux 在**转发之前**拒掉的：产物里那处直接 return，
+ *      没有走到 enqueue。
+ *   ③ 会话找不到 —— 无论这个 not found 是 mux 回的（sessionId 不属于任何已连接窗口）
+ *      还是 agent 回的（新进程内存里没有旧会话的 state），都意味着找不到会话上下文，
+ *      不可能已经开始执行。
+ *
+ * 剩下的一切归为「不确定」：可能是 agent 跑起来之后才出的错。这时宁可如实告诉用户
+ * 「结果不确定，去电脑上看一眼」，也不要替他赌一次重投。
+ *
+ * 注意这三类恰好覆盖了实际最常撞到的失败（reload 后 not found、连接闪断、
+ * 悬空的 in-flight 标记），所以日常使用感受不变 —— 自动降级照旧。
+ */
+function isDefinitelyNotDelivered(err) {
+  if (!err) return false;
+  const msg = String(err.message || err);
+  if (/connection not open/i.test(msg)) return true;
+  if (isPromptInFlight(err)) return true;
+  if (isSessionUnknown(err)) return true;
+  return false;
+}
+
+/** 投递结果不确定时给用户的说明。核心是让他知道该去做什么，以及我们为什么不替他重试。 */
+const UNCERTAIN_HINT =
+  '消息可能已经送到 Kiro 了，但没能确认结果。' +
+  '这里刻意没有自动重发 —— 如果它其实已经在跑，重发会让同一件事做两遍（改文件、跑命令都会重来一次）。' +
+  '请在电脑上看一眼那个会话：确认 agent 没有动，再发一次。';
+
 async function sendToSession(sessionId, text, attachments) {
   const atts = Array.isArray(attachments) ? attachments : [];
   const prompt = blocksFor(text, atts);
@@ -738,7 +780,7 @@ async function sendToSession(sessionId, text, attachments) {
       log(`[send] via mux port=${conn.endpoint.port} session=${sessionId}`);
       return { via: 'mux' };
     }
-    log(`[send] mux 失败，降级命令: ${lastFailure.message}`);
+    log(`[send] mux 失败: ${lastFailure.message}`);
   }
   // 降级通道只能传纯文本。带附件时如实报错 —— 悄悄把附件丢掉再显示「已发送」，
   // 是最坏的一种失败：用户以为图发出去了，而 agent 从没见过它。
@@ -748,7 +790,24 @@ async function sendToSession(sessionId, text, attachments) {
     if (lastFailure && isPromptInFlight(lastFailure)) {
       throw new Error(`${IN_FLIGHT_HINT}（带附件的消息只能走 mux，没有降级通道）`);
     }
+    // 带附件时本来就没有第二条路可走，所以这里不涉及重投。但「没送出去」和
+    // 「可能送到了只是不知道结果」对用户是两件事：前者可以放心重发，后者得先去看一眼。
+    if (lastFailure && !isDefinitelyNotDelivered(lastFailure)) {
+      throw new Error(`${UNCERTAIN_HINT}（原始错误: ${lastFailure.message}）`);
+    }
     throw new Error(`mux 通道不可用，带附件的消息发不出去（降级通道只支持纯文本）`);
+  }
+  // 关键判断：能不能换命令通道重投。
+  //
+  // 只有确认「没投进去」才重投；不确定的情况如实报错，让用户自己决定。
+  // 这条是刻意选择的取舍 —— 宁可让人多看一眼电脑，也不要让 agent 悄悄把带副作用的
+  // 活干两遍。判据与依据见 isDefinitelyNotDelivered 的注释。
+  if (lastFailure && !isDefinitelyNotDelivered(lastFailure)) {
+    log(`[send] 不确定是否已送达，刻意不重投 session=${sessionId}: ${lastFailure.message}`);
+    throw new Error(`${UNCERTAIN_HINT}（原始错误: ${lastFailure.message}）`);
+  }
+  if (lastFailure) {
+    log(`[send] 确认没投进去，降级命令 session=${sessionId}`);
   }
   // 降级：kiroAgent.sessions.sendPrompt(sessionId, text) 在扩展产物中确认 sessionId 有效
   try {
@@ -1500,5 +1559,19 @@ module.exports = {
     getRelay: () => relay,
     RESOLVED_KEEP_MS,
     PERMISSION_MAX_RECORDS,
+    // 「失败之后要不要换命令通道重投」这个决策必须真跑一遍：它的错法是
+    // 判据用反（少一个 !），而那种错静态检查看不出来，表现是 agent 把带副作用的活干两遍。
+    // 下面这几个一起暴露，测试才能替换掉 muxPool、喂各种失败进去看它选哪条路。
+    sendToSession,
+    isDefinitelyNotDelivered,
+    isPromptInFlight,
+    isSessionUnknown,
+    setMuxPoolForTest: (p) => { muxPool = p; },
+    // 把两个等待窗口调小，否则每个失败场景都要真等 2 秒（not found 那条还要等两次加 attach）
+    setSettleForTest: (send, attach) => {
+      if (typeof send === 'number') SEND_SETTLE_MS = send;
+      if (typeof attach === 'number') ATTACH_SETTLE_MS = attach;
+    },
+    getSettleForTest: () => ({ send: SEND_SETTLE_MS, attach: ATTACH_SETTLE_MS }),
   },
 };

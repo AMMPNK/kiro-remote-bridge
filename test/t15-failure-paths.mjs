@@ -175,5 +175,202 @@ if (startFn) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// ④ mux 失败之后要不要换命令通道重投
+// ---------------------------------------------------------------------------
+// 这一组是真跑 sendToSession，不是静态检查。理由：这个决策的错法是判据用反
+// （少一个 `!`），而那种错语法和静态检查都看不出来，表现是 agent 把带副作用的活
+// 干两遍（改文件、跑命令都会重来）。必须真的喂一个失败进去、看它走了哪条路。
+//
+// 判断「有没有重投」的信号：vscode.commands.executeCommand 有没有被调用
+// kiroAgent.sessions.sendPrompt —— 那就是降级通道。
+const { createRequire } = await import('node:module');
+const { default: Module } = await import('node:module');
+const { mkdtempSync, mkdirSync, writeFileSync, rmSync } = await import('node:fs');
+const { tmpdir } = await import('node:os');
+
+const SANDBOX = mkdtempSync(join(tmpdir(), 'krb-send-'));
+const REAL_HOME = process.env.HOME;
+process.env.HOME = SANDBOX;
+mkdirSync(join(SANDBOX, '.kiro', 'sessions'), { recursive: true });
+
+const executed = [];
+const fakeVscode = {
+  version: '1.85.0-test',
+  StatusBarAlignment: { Right: 2 },
+  ViewColumn: { Beside: 2 },
+  Uri: { file: (p) => ({ fsPath: p, toString: () => 'file://' + p }) },
+  window: {
+    createOutputChannel: () => ({ appendLine() {}, show() {}, dispose() {} }),
+    createStatusBarItem: () => ({ text: '', tooltip: '', command: '', show() {}, hide() {}, dispose() {} }),
+    createWebviewPanel: () => ({ webview: { html: '' }, dispose() {} }),
+    showInformationMessage() {},
+    showWarningMessage() {},
+    showErrorMessage() {},
+  },
+  commands: {
+    registerCommand: () => ({ dispose() {} }),
+    getCommands: async () => [],
+    executeCommand: async (cmd, ...args) => {
+      executed.push({ cmd, args });
+      if (cmd === 'kiro.agentRegistry.getAgentEndpoints') return [];
+      return undefined;
+    },
+  },
+  workspace: {
+    workspaceFolders: [],
+    getConfiguration: () => ({ get: (k, d) => d }),
+  },
+};
+
+const stubPath = join(SANDBOX, 'vscode-stub.cjs');
+const require_ = createRequire(join(ROOT, 'package.json'));
+const origResolve = Module._resolveFilename;
+Module._resolveFilename = function (request, ...rest) {
+  if (request === 'vscode') return stubPath;
+  return origResolve.call(this, request, ...rest);
+};
+writeFileSync(stubPath, 'module.exports = globalThis.__FAKE_VSCODE__;');
+globalThis.__FAKE_VSCODE__ = fakeVscode;
+
+const ext = require_('./src/extension.js');
+const T = ext.__test;
+
+// 必须先 activate 一次：sendToSession 开头要查会话属于哪个 workspace，走的是模块级的
+// store，而它只在 activate() 里建。不调的话每个用例都死在 store 是 undefined 上 ——
+// 而那时「不确定 → 没有重投」这类断言会**照样通过**（因为确实没重投，只不过是崩了），
+// 是典型的假绿。默认配置下 activate 不注册 timer、不发命令、不写文件（见 t11），
+// 且 HOME 已隔离到沙箱，所以这里调它是安全的。
+ext.activate({ subscriptions: [], extensionPath: ROOT });
+
+check('__test 暴露了这条决策链需要的东西',
+  typeof T.sendToSession === 'function' &&
+  typeof T.isDefinitelyNotDelivered === 'function' &&
+  typeof T.setMuxPoolForTest === 'function' &&
+  typeof T.setSettleForTest === 'function');
+
+// ---- 判据本身（纯函数，先把边界钉死）
+const notDelivered = T.isDefinitelyNotDelivered;
+check('判据：connection not open → 确定没投进去（request 里发送前就 reject 了）',
+  notDelivered(new Error('mux connection not open')) === true);
+check('判据：in-flight → 确定没投进去（mux 转发前 return，没 enqueue）',
+  notDelivered(Object.assign(new Error('A prompt is already in-flight for session x'), { code: -32002 })) === true);
+check('判据：Session not found → 确定没投进去（找不到上下文，不可能开始执行）',
+  notDelivered(new Error('Session abc not found')) === true);
+// 下面这条是这次改动的核心：连接在**发出之后**断掉，消息可能已经到了 agent。
+// 把它误判成「没投进去」就会重投，让同一件事做两遍。
+check('判据：socket hang up → 不确定（可能已送到 agent，不能重投）',
+  notDelivered(new Error('socket hang up')) === false);
+check('判据：agent 内部错误 → 不确定',
+  notDelivered(new Error('internal error while running tool')) === false);
+check('判据：空值 → false（调用方另有 null 分支，这里不能返回 null）',
+  notDelivered(null) === false && notDelivered(undefined) === false);
+
+// ---- 决策流（真跑 sendToSession）
+T.setSettleForTest(20, 20);
+const settle = T.getSettleForTest();
+check('等待窗口已调小，测试不用真等 2 秒', settle.send === 20 && settle.attach === 20,
+  `send=${settle.send}ms attach=${settle.attach}ms`);
+
+/** 造一个假 muxPool：sendPrompt 按 behave 指定的方式失败或成功 */
+function poolThat(behave) {
+  let calls = 0;
+  return {
+    pool: {
+      pickForWorkspace: () => (behave === 'no-conn' ? null : {
+        endpoint: { port: 12345 },
+        sendPrompt: () => {
+          calls += 1;
+          if (behave === 'ok') return Promise.resolve({ stopReason: 'end_turn' });
+          return Promise.reject(behave);
+        },
+      }),
+    },
+    promptCalls: () => calls,
+  };
+}
+const fallbackCalls = () =>
+  executed.filter((e) => e.cmd === 'kiroAgent.sessions.sendPrompt').length;
+
+async function runSend(behave, atts) {
+  const { pool, promptCalls } = poolThat(behave);
+  T.setMuxPoolForTest(pool);
+  executed.length = 0;
+  let result = null, error = null;
+  try {
+    result = await T.sendToSession('sess-1', '把 README 里的版本号改成 9.9.9', atts);
+  } catch (e) {
+    error = e;
+  }
+  return { result, error, fallback: fallbackCalls(), promptCalls: promptCalls() };
+}
+
+// mux 成功 → 不该出现任何降级
+const okRun = await runSend('ok');
+check('mux 成功 → via mux，且完全不碰降级通道',
+  okRun.result && okRun.result.via === 'mux' && okRun.fallback === 0,
+  `via=${okRun.result && okRun.result.via} 降级调用=${okRun.fallback}`);
+
+// 确定没投进去的三类 → 照旧自动降级，用户无感
+const notOpen = await runSend(new Error('mux connection not open'));
+check('connection not open → 自动降级到命令通道',
+  notOpen.result && notOpen.result.via === 'command' && notOpen.fallback === 1,
+  notOpen.error ? `却抛了错: ${notOpen.error.message.slice(0, 40)}` : `降级调用=${notOpen.fallback}`);
+
+const inflightRun = await runSend(
+  Object.assign(new Error('A prompt is already in-flight for session sess-1'), { code: -32002 })
+);
+check('in-flight → 自动降级到命令通道（高频路径，体感不能变差）',
+  inflightRun.result && inflightRun.result.via === 'command' && inflightRun.fallback === 1,
+  inflightRun.error ? `却抛了错: ${inflightRun.error.message.slice(0, 40)}` : '');
+
+const notFoundRun = await runSend(new Error('Session sess-1 not found'));
+check('not found → 先让桌面加载再重试，最后降级（reload 后最常撞的那条）',
+  notFoundRun.result && notFoundRun.result.via === 'command',
+  notFoundRun.error ? `却抛了错: ${notFoundRun.error.message.slice(0, 40)}` : `mux 尝试=${notFoundRun.promptCalls} 次`);
+check('not found 时确实重试了 mux（attachDesktop 之后再试一次）',
+  notFoundRun.promptCalls === 2, `实际 ${notFoundRun.promptCalls} 次`);
+
+// 不确定的 → 绝不自动重投，如实报错
+const uncertain = await runSend(new Error('socket hang up'));
+check('不确定 → 不碰降级通道（这是本条改动的核心）',
+  uncertain.fallback === 0,
+  uncertain.fallback ? `错误地重投了 ${uncertain.fallback} 次` : '');
+check('不确定 → 抛错而不是假装成功',
+  !!uncertain.error && !uncertain.result,
+  uncertain.result ? `却返回了 via=${uncertain.result.via}` : '');
+check('不确定 → 报错里说明「可能已送到」而不是「发送失败」',
+  !!uncertain.error && /可能已经送到/.test(uncertain.error.message));
+check('不确定 → 报错里告诉用户去电脑上确认',
+  !!uncertain.error && /电脑上看一眼|再发一次/.test(uncertain.error.message));
+check('不确定 → 报错里带上原始错误，便于排查',
+  !!uncertain.error && /socket hang up/.test(uncertain.error.message));
+
+// 压根没有 mux 连接 → 命令是唯一的路，重投风险不存在，必须照走
+const noConn = await runSend('no-conn');
+check('没有任何 mux 连接 → 直接走命令通道（不受新判据影响）',
+  noConn.result && noConn.result.via === 'command' && noConn.fallback === 1,
+  noConn.error ? `却抛了错: ${noConn.error.message.slice(0, 40)}` : '');
+
+// 带附件时没有降级通道，但「没送出去」和「可能送到了」对用户是两件事
+const attImg = [{ name: 'a.png', mime: 'image/png', data: Buffer.from([1, 2, 3]).toString('base64') }];
+const attUncertain = await runSend(new Error('socket hang up'), attImg);
+check('带附件 + 不确定 → 报「可能已送到」',
+  !!attUncertain.error && /可能已经送到/.test(attUncertain.error.message),
+  attUncertain.error ? attUncertain.error.message.slice(0, 50) : '没抛错');
+const attInflight = await runSend(
+  Object.assign(new Error('A prompt is already in-flight'), { code: -32002 }), attImg
+);
+check('带附件 + in-flight → 报自救说明而不是「通道不可用」',
+  !!attInflight.error && /点一次停止/.test(attInflight.error.message),
+  attInflight.error ? attInflight.error.message.slice(0, 50) : '没抛错');
+check('带附件时一律不走降级通道（纯文本通道会悄悄丢掉附件）',
+  attUncertain.fallback === 0 && attInflight.fallback === 0);
+
+// 收尾：把 HOME 放回去，删掉沙箱
+Module._resolveFilename = origResolve;
+process.env.HOME = REAL_HOME;
+rmSync(SANDBOX, { recursive: true, force: true });
+
 console.log(`结果: ${pass} 通过 / ${fail} 失败`);
 process.exit(fail ? 1 : 0);
