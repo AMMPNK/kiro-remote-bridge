@@ -505,8 +505,21 @@ let archived = loadArchived();
 const saveArchived = () => {
   try { localStorage.setItem(ARCHIVED_KEY, JSON.stringify([...archived])); } catch (_) {}
 };
+/*
+ * 空会话默认**显示**。
+ *
+ * 原先默认折叠，理由是「空会话是噪音」。实际用起来反了：手机上刚建的新会话必然是空的
+ * （还没发第一条消息），于是它一出生就被收起来，人得先想起来去点一下「空会话 N」
+ * 才能找到自己刚创建的东西 —— 折叠恰好命中了最需要看见的那一类。
+ *
+ * 手动归档已经能解决「列表里东西太多」这个问题，不需要再按空/非空自动隐藏一批。
+ * 那个 chip 保留着，想折叠随时可以点，选择会记在 localStorage 里。
+ *
+ * 注意这里的 `=== '1'` 换成了 `!== '0'`：没存过值时要走默认显示，
+ * 而不是因为「读不到 '1'」就折叠。
+ */
 let showEmpty = (() => {
-  try { return localStorage.getItem(SHOW_EMPTY_KEY) === '1'; } catch (_) { return false; }
+  try { return localStorage.getItem(SHOW_EMPTY_KEY) !== '0'; } catch (_) { return true; }
 })();
 const setShowEmpty = (v) => {
   showEmpty = v;
@@ -761,10 +774,47 @@ function archive(sessionId) {
   });
 }
 
+/*
+ * 未发送的草稿按会话隔离。
+ *
+ * 输入框的文本在 DOM 里、附件在全局的 `atts` 数组里，两者都不跟着会话走 ——
+ * 于是在 A 会话里打了一半的字和挑好的图，切到 B 会话还在那儿，一按发送就发错了地方。
+ * 附件尤其危险：它没有可见的"属于哪个会话"的标记，看起来就像是本会话的东西。
+ *
+ * 存内存不存 localStorage：附件是 base64，几 MB 一张，几个会话就能顶爆存储配额，
+ * 而配额写满的报错在移动端浏览器里表现不一（有的抛异常、有的静默丢弃）。
+ * 刷新页面丢草稿是可以接受的，发错会话不行。
+ */
+const drafts = new Map();
+
+/** 把当前输入框与附件存进 owner 那个会话的草稿位；空草稿直接删掉，别让 Map 无限长 */
+function stashDraft(owner) {
+  if (!owner) return;
+  const text = input ? input.value : '';
+  if (!text && !atts.length) drafts.delete(owner);
+  else drafts.set(owner, { text, atts: atts.slice() });
+}
+
+/** 取出某个会话的草稿填回输入框；没有草稿就清空，**不能保留上一个会话的内容** */
+function restoreDraft(owner) {
+  const d = (owner && drafts.get(owner)) || null;
+  atts = d ? d.atts.slice() : [];
+  if (input) {
+    input.value = d ? d.text : '';
+    input.style.height = 'auto';
+    if (d && d.text) input.style.height = Math.min(input.scrollHeight, 132) + 'px';
+  }
+  renderAtts();
+  syncSendState();
+}
+
 // ---------------------------------------------------------------- 会话详情
 function openSession(sessionId, from) {
   chatFrom = from || 'list';
   const s = sessions.find((x) => x.sessionId === sessionId);
+  // 切走之前先把当前会话的草稿收好。openSession 也用于「从一个会话直接跳到另一个」，
+  // 所以这里必须处理 openId 与 sessionId 不同的情况。
+  if (openId && openId !== sessionId) stashDraft(openId);
   openId = sessionId;
   openTitle = s ? s.title : sessionId;
   view = 'chat';
@@ -776,6 +826,9 @@ function openSession(sessionId, from) {
   el('newBtn').classList.add('hide');
   el('searchWrap').classList.add('hide');
   el('composer').classList.remove('hide');
+  // 恢复这个会话自己的草稿（没有就清空）。必须在 composer 显示之后做，
+  // 因为算 textarea 高度要元素已经可见。
+  restoreDraft(sessionId);
   mainEl.innerHTML = '<div class="sys">加载历史…</div>';
   // 进来就按列表的判断定一次：最常见的场景正是「电脑上跑着，人从手机进来看」
   setTurnActive(!!s && liveOf(s) === 'running');
@@ -1597,6 +1650,15 @@ function connect() {
       case 'created':
         closeSheet();
         el('createBtn').textContent = '创建并打开';
+        /*
+         * notes 是「已经创建成功，但有件事你必须知道」——目前唯一的一条是跨窗口创建：
+         * agent 实际会在 Bridge 所在窗口的工作区里干活，而不是你选的那个。
+         * 它比 failed 更需要被看见（失败你会重试，而这个会静默产出错误的结果），
+         * 所以用 alert 而不是 toast：toast 几秒就没了，人在路上很容易错过。
+         */
+        if (m.notes && m.notes.length) {
+          setTimeout(() => alert('注意\n\n' + m.notes.join('\n\n')), 60);
+        }
         if (m.failed && m.failed.length) toast(`会话已建，但${m.failed.join('；')}`);
         else if (m.applied && m.applied.length) toast(`已创建（${m.applied.join(' + ')}已设置）`);
         else toast('已创建');
@@ -1772,6 +1834,9 @@ function unarchive(sessionId) {
 
 // ---------------------------------------------------------------- 交互
 el('back').onclick = () => {
+  // 退回列表前把草稿收进当前会话名下。少了这一步，草稿会滞留在输入框里，
+  // 下次进任意一个会话就变成了那个会话的内容。
+  stashDraft(openId);
   if (view === 'chat' && chatFrom === 'archived' && archived.size) renderArchived();
   else renderList();
 };
@@ -1948,6 +2013,8 @@ sendBtn.onclick = () => {
   // 乐观置位：不等 sent 应答。这几秒里 agent 已经在跑，停止键必须已经可点
   lastSendAt = Date.now();
   setTurnActive(true);
+  // 已经发出去了，草稿不该再留着 —— 否则回到这个会话又会看到刚发过的内容
+  drafts.delete(openId);
   input.value = '';
   input.style.height = 'auto';
   atts = [];

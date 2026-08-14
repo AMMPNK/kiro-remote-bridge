@@ -561,6 +561,43 @@ async function createSession(workspacePath, picks) {
       log(`[create] 设置${LABEL[configId]}失败（会话已创建，用默认值）: ${msg}`);
     }
   }
+  /*
+   * 跨窗口创建的会话，实际会在**本窗口**的工作区里干活 —— 这件事必须告诉用户。
+   *
+   * 原因链：`session/new` 是发给目标窗口的连接的，所以会话确实建在目标 workspace 下；
+   * 但紧接着的 attachDesktop 走 `vscode.commands.executeCommand`，**只能在本窗口执行**
+   * （扩展宿主一个窗口一个进程，命令不能跨窗口）。被它打开之后,本窗口就接管了这个会话,
+   * 连 agent 看到的工作区上下文一起接管。
+   *
+   * 实测证据(不是推断):手机上选 Kiro 工作区建的会话,磁盘上在两个 workspace 目录下
+   * 各有一份 session.json —— 目标窗口那份带着正确的模型、却没有任何消息;
+   * 本窗口那份有 175KB 消息,而消息里出现的路径**全是本窗口工作区下的**,
+   * 一条目标工作区的路径都没有。也就是说 agent 在错误的目录里干活。
+   *
+   * 为什么不干脆不 attachDesktop:那样这个会话的审批会在 6~20ms 内被判 cancelled
+   * （见下面那段注释的依据），手机上根本批不动,任务也做不下去。两害相权,
+   * 现在的选择是**保留 attach、但把真实归属说清楚**,而不是静默地跑错目录。
+   *
+   * 根治要让「拥有会话的那个窗口」自己去 attach,而 vscode 命令跨不了窗口,
+   * 需要新增一条窗口间通道（非主窗口的扩展实例以从属模式连上主实例）。
+   * 那是个独立的改动,记在 BACKLOG 里。
+   */
+  const localFolders = (vscode.workspace.workspaceFolders || []).map((f) => f.uri.fsPath);
+  const samePath = (a, b) => path.resolve(String(a)) === path.resolve(String(b));
+  const targetIsLocal = !workspacePath || localFolders.some((p) => samePath(p, workspacePath));
+  const notes = [];
+  if (!targetIsLocal) {
+    const localName = localFolders.length ? path.basename(localFolders[0]) : '(无工作区)';
+    const wantName = path.basename(String(workspacePath));
+    const warn =
+      `会话建在「${wantName}」，但远程审批要求由本窗口托管它，` +
+      `所以 agent 实际是在「${localName}」这个工作区里干活。` +
+      `要真在「${wantName}」里改东西，得在电脑上把 Bridge 切到那个窗口再建会话。`;
+    log(`[create] ★ 跨窗口创建 target=${workspacePath} 本窗口=${localFolders.join(',')}`);
+    log(`[create] ★ ${warn}`);
+    notes.push(warn);
+  }
+
   // 让桌面端 attach 到这个会话，否则它的审批请求会被立刻取消。
   // 依据：ACP SDK 的 requestPermission 是「按 sessionId 找 handler，找不到就直接返回
   // cancelled」（源码注释原文 defaults to cancelled if no handler），而 handler 由
@@ -569,7 +606,7 @@ async function createSession(workspacePath, picks) {
   // Kiro 自己的程序化建会话流程也是先 viewSession 再发 prompt，这里沿用同一做法。
   await attachDesktop(sessionId);
 
-  return { sessionId, cwd, applied, failed };
+  return { sessionId, cwd, applied, failed, notes };
 }
 
 /**
@@ -1610,6 +1647,7 @@ module.exports = {
     // 判据用反（少一个 !），而那种错静态检查看不出来，表现是 agent 把带副作用的活干两遍。
     // 下面这几个一起暴露，测试才能替换掉 muxPool、喂各种失败进去看它选哪条路。
     sendToSession,
+    createSession,
     isDefinitelyNotDelivered,
     isPromptInFlight,
     isSessionUnknown,

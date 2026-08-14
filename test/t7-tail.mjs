@@ -279,6 +279,62 @@ check('tail 带回最新 status', d.status === 'in_progress', d.status);
     s5.findSessionDir(undefined) === null);
 }
 
+// 12b. 同一 sessionId 有多份目录时，必须返回**带消息**的那一份
+//
+// 实测故障：手机上新建会话选了 A 工作区，会话在 A 窗口建好；随后 attachDesktop 在
+// relay 所在的 B 窗口把它打开，B 窗口接管并把消息写进 B 的目录。于是两个 workspace
+// 下都有 <sessionId>/，只有 B 那份有 messages.jsonl。手机上看到「运行中」，
+// 正文却是「这个会话还没有内容」——因为查目录时返回了先扫到的空的那份。
+//
+// 缓存让它更难自愈：新建会话的那一刻两份都是空的，缓存锁定第一份，
+// 之后消息写进另一份也不会重新找，那条会话就永久显示为空。
+{
+  const pickRoot = path.join(root, 'pick-test');
+  const mk2 = (rel, id, body) => {
+    const d = path.join(pickRoot, rel);
+    fs.mkdirSync(d, { recursive: true });
+    fs.writeFileSync(path.join(d, 'session.json'), JSON.stringify({ id, status: 'idle' }));
+    if (body !== null) fs.writeFileSync(path.join(d, 'messages.jsonl'), body);
+    return d;
+  };
+  class PickStore extends SessionStore {
+    constructor(dirs) { super(() => {}); this._dirs = dirs; }
+    get root() { return pickRoot; }
+    listSessionDirs() { return this._dirs; }
+  }
+
+  // 空的排在前、有内容的排在后 —— 正是实测那个故障的形状
+  const emptyOne = mk2('wsKiro/sess_x', 'sess_x', '');
+  const realOne = mk2('wsPersonal/sess_x', 'sess_x', '{"payload":{"type":"turn_start"}}\n');
+  const stx = new PickStore([emptyOne, realOne]);
+  check('★ 同 id 两份、只有一份有消息 → 返回有消息的那份（哪怕它排在后面）',
+    stx.findSessionDir('sess_x') === realOne,
+    `得到 ${path.basename(path.dirname(stx.findSessionDir('sess_x') || 'null'))}`);
+  check('★ 重复查询仍是同一份（缓存没把结果改回去）',
+    stx.findSessionDir('sess_x') === realOne);
+
+  // 缓存锁定空目录之后，消息才写进另一份 —— 必须能自愈
+  const e2 = mk2('wsA2/sess_y', 'sess_y', '');
+  const r2 = mk2('wsB2/sess_y', 'sess_y', null); // 先连 messages.jsonl 都没有
+  const sty = new PickStore([e2, r2]);
+  check('两份都还空着时，先返回第一份', sty.findSessionDir('sess_y') === e2);
+  fs.writeFileSync(path.join(r2, 'messages.jsonl'), '{"payload":{"type":"turn_start"}}\n');
+  check('★ 之后消息写进另一份 → 重新找到它，不被缓存锁死（新建会话必走这条路）',
+    sty.findSessionDir('sess_y') === r2,
+    `得到 ${path.basename(path.dirname(sty.findSessionDir('sess_y') || 'null'))}`);
+
+  // 多份都有消息时取内容最多的，避免读到被截断的副本
+  const small = mk2('wsS/sess_z', 'sess_z', 'a\n');
+  const big = mk2('wsB3/sess_z', 'sess_z', 'a\nb\nc\nd\ne\n');
+  const stz = new PickStore([small, big]);
+  check('多份都有消息 → 取最大的那份', stz.findSessionDir('sess_z') === big);
+
+  // 反方向：只有一份时行为不变，别为了处理重复把正常情况搞坏
+  const only = mk2('wsOnly/sess_solo', 'sess_solo', '');
+  const stsolo = new PickStore([only]);
+  check('只有一份（且是空的）→ 照样返回它', stsolo.findSessionDir('sess_solo') === only);
+}
+
 fs.rmSync(root, { recursive: true, force: true });
 
 // ---------------------------------------------------------------------------

@@ -377,25 +377,69 @@ class SessionStore {
    *
    * 缓存足够了：冷查一次照旧，之后每 900ms 的 tail 就都是一次 existsSync。
    */
+  /**
+   * 按 sessionId 找会话目录。
+   *
+   * **同一个 sessionId 可能在多个 workspace 目录下各有一份**（见 dedupeSessions 的说明），
+   * 而其中往往只有一份带 messages.jsonl。所以不能"第一个匹配就返回" ——
+   * 返回了空的那份，历史就是空的，而会话明明在跑。
+   *
+   * 实测故障：手机上新建会话，选的是 A 工作区，会话在 A 窗口建好；随后
+   * attachDesktop 在 relay 所在的 B 窗口把它打开，B 窗口接管并把消息写进了 B 的目录。
+   * 于是 A、B 两个 workspace 下都有 `<sessionId>/`，只有 B 那份有 messages.jsonl。
+   * 手机上看到「运行中」但正文是「这个会话还没有内容」。
+   *
+   * 缓存也必须跟着改：新建会话的那一刻两份都还是空的，缓存会锁定先扫到的那个，
+   * 之后消息写进另一份也不会重新找 —— **那条会话就永久显示为空**。
+   * 所以缓存命中时要再确认它有消息文件；没有就当缓存不可信，重新扫一遍。
+   * 代价是"确实还没说过话的新会话"每次都要扫一次目录（两层 readdir，很便宜），
+   * 换掉的是一个不会自愈的错误状态。
+   */
   findSessionDir(sessionId) {
     if (!sessionId) return null;
+    const hasMsgs = (d) => {
+      try {
+        return fs.statSync(path.join(d, 'messages.jsonl')).size > 0;
+      } catch (_) {
+        return false;
+      }
+    };
+
     const cached = this.dirCache.get(sessionId);
     if (cached) {
-      if (fs.existsSync(cached)) return cached;
-      this.dirCache.delete(sessionId); // 目录已被删除或移动，重新找一遍
+      if (!fs.existsSync(cached)) {
+        this.dirCache.delete(sessionId); // 目录已被删除或移动，重新找一遍
+      } else if (hasMsgs(cached)) {
+        return cached; // 有内容，就是它
+      }
+      // 存在但还是空的 —— 不能就此认定，别处可能有带消息的同名目录
     }
+
+    const hits = [];
     for (const dir of this.listSessionDirs()) {
       if (path.basename(dir) === sessionId) {
-        this.dirCache.set(sessionId, dir);
-        return dir;
+        hits.push(dir);
+        continue;
       }
       const meta = safeReadJson(path.join(dir, 'session.json'));
-      if (meta && meta.id === sessionId) {
-        this.dirCache.set(sessionId, dir);
-        return dir;
-      }
+      if (meta && meta.id === sessionId) hits.push(dir);
     }
-    return null;
+    if (!hits.length) return null;
+
+    // 有消息文件的优先；多份都有时取最大的那份（内容最全，不会读到被截断的副本）
+    const withMsgs = hits.filter(hasMsgs);
+    let best;
+    if (withMsgs.length) {
+      best = withMsgs.reduce((a, b) => {
+        const sa = fs.statSync(path.join(a, 'messages.jsonl')).size;
+        const sb = fs.statSync(path.join(b, 'messages.jsonl')).size;
+        return sb > sa ? b : a;
+      });
+    } else {
+      best = cached && hits.includes(cached) ? cached : hits[0];
+    }
+    this.dirCache.set(sessionId, best);
+    return best;
   }
 
   /**

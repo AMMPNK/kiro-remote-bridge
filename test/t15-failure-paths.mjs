@@ -218,10 +218,15 @@ const fakeVscode = {
     },
   },
   workspace: {
-    workspaceFolders: [],
+    // 用 getter 读一个可变变量：跨窗口创建的检测就是拿这个和目标 workspace 比，
+    // 写成数组字面量的话没法在用例之间切换「本窗口是哪个工作区」
+    get workspaceFolders() {
+      return localWsFolders;
+    },
     getConfiguration: () => ({ get: (k, d) => d }),
   },
 };
+let localWsFolders = [];
 
 const stubPath = join(SANDBOX, 'vscode-stub.cjs');
 const require_ = createRequire(join(ROOT, 'package.json'));
@@ -366,6 +371,147 @@ check('带附件 + in-flight → 报自救说明而不是「通道不可用」',
   attInflight.error ? attInflight.error.message.slice(0, 50) : '没抛错');
 check('带附件时一律不走降级通道（纯文本通道会悄悄丢掉附件）',
   attUncertain.fallback === 0 && attInflight.fallback === 0);
+
+// ---------------------------------------------------------------------------
+// ④b 草稿必须按会话隔离
+// ---------------------------------------------------------------------------
+// 实测故障：在 A 会话里打了一半的字、挑好的图，切到 B 会话还在输入框里，
+// 一按发送就发到 B 去了。附件尤其危险——它没有"属于哪个会话"的可见标记。
+//
+// 放在这个文件里是因为它就是一条失败路径：正常流程（在一个会话里打字、发送）永远
+// 碰不到，只有"切会话"这个动作才暴露。而这类跨状态的错误，静态检查抓不到——
+// 实测把 openSession 里存草稿那行删掉，t8 的 UI 一致性检查 0 项失败。
+{
+  // 必须显式带上 restoreDraft 再收尾：只写 `[\s\S]*?\n\}\n` 的话非贪婪会停在
+  // stashDraft 的右括号处，抠出来的片段少了一半，而症状是「restoreDraft is not defined」
+  const seg2 = /const drafts = new Map\(\);[\s\S]*?function restoreDraft[\s\S]*?\n\}\n/.exec(script);
+  check('能从 app.html 里定位草稿隔离那段', !!seg2,
+    seg2 ? `${seg2[0].split('\n').length} 行` : '正则没匹配上');
+  if (seg2) {
+    const mkInput = () => ({ value: '', scrollHeight: 20, style: { height: '' } });
+    const ctx2 = createContext({});
+    ctx2.input = mkInput();
+    ctx2.atts = [];
+    ctx2.renderAtts = () => {};
+    ctx2.syncSendState = () => {};
+    runInContext(
+      seg2[0] +
+        '\n;globalThis.__api = { stashDraft, restoreDraft, drafts,' +
+        ' getAtts: () => atts, setAtts: (v) => { atts = v; } };',
+      ctx2
+    );
+    const api = ctx2.__api;
+
+    // 在 A 会话里打字并加一个附件
+    ctx2.input.value = '这段话是给 A 的';
+    api.setAtts([{ name: 'a.png', mimeType: 'image/png', data: 'AAA' }]);
+    api.stashDraft('sessA');
+    check('草稿按会话存起来了', api.drafts.has('sessA'));
+
+    // 切到没有草稿的 B —— 输入框和附件都必须清空
+    api.restoreDraft('sessB');
+    check('★ 切到别的会话：文本不跟过去', ctx2.input.value === '',
+      `input=${JSON.stringify(ctx2.input.value)}`);
+    check('★ 切到别的会话：附件不跟过去', api.getAtts().length === 0,
+      `atts=${api.getAtts().length} 个`);
+
+    // 在 B 里写点别的，再切回 A —— 各自的内容要对得上
+    ctx2.input.value = 'B 的内容';
+    api.stashDraft('sessB');
+    api.restoreDraft('sessA');
+    check('★ 切回 A：拿回 A 自己的文本', ctx2.input.value === '这段话是给 A 的',
+      JSON.stringify(ctx2.input.value));
+    check('★ 切回 A：拿回 A 自己的附件',
+      api.getAtts().length === 1 && api.getAtts()[0].name === 'a.png',
+      JSON.stringify(api.getAtts().map((x) => x.name)));
+
+    // 附件数组要是副本，不能和草稿里那份共享引用 ——
+    // 共享的话在 A 里加一张图会同时改掉已存起来的草稿
+    api.getAtts().push({ name: 'b.png', mimeType: 'image/png', data: 'BBB' });
+    api.restoreDraft('sessA');
+    check('★ 草稿里的附件是副本，不被后续改动污染', api.getAtts().length === 1,
+      `恢复后 ${api.getAtts().length} 个`);
+
+    // 空草稿不该占着 Map
+    ctx2.input.value = '';
+    api.setAtts([]);
+    api.stashDraft('sessA');
+    check('清空后草稿记录被删掉，Map 不会无限长', !api.drafts.has('sessA'));
+
+    // 没有 owner 时不能乱存（例如还没进任何会话就返回列表）
+    const before = api.drafts.size;
+    api.stashDraft(null);
+    check('owner 为空时不写草稿', api.drafts.size === before);
+  }
+
+  // 纯函数对了不等于接上了：这几处调用点少一个，草稿就会串台。
+  // 这是「数据层加了函数但 UI 零调用」那类错误的防线。
+  check('openSession 切走前存草稿', /if \(openId && openId !== sessionId\) stashDraft\(openId\)/.test(script));
+  check('openSession 进来后恢复草稿', /restoreDraft\(sessionId\)/.test(script));
+  check('返回列表时存草稿', /stashDraft\(openId\);\s*\n\s*if \(view === 'chat'/.test(script));
+  check('发送后清掉该会话的草稿', /drafts\.delete\(openId\)/.test(script));
+}
+
+// ---------------------------------------------------------------------------
+// ⑤ 跨窗口创建会话：agent 实际在哪个工作区干活，必须说清楚
+// ---------------------------------------------------------------------------
+// 实测故障：手机上选 Kiro 工作区建会话，agent 却在 personal 工作区干活。
+// 原因是 createSession 最后要 attachDesktop 让桌面面板注册审批 handler，而
+// vscode.commands 只能在**本窗口**执行，被打开的会话就此由本窗口接管，
+// 连工作区上下文一起接管。磁盘上能看到同一 sessionId 在两个 workspace 下各有一份，
+// 目标窗口那份带正确模型却没有消息，本窗口那份有 175KB 消息、且消息里的路径全是本窗口的。
+//
+// 现在不静默接管，会带一条 notes 回去。这里测两个方向：跨窗口时必须有提示，
+// 同窗口时必须没有（不然每次创建都弹一个无关的警告，人会开始无视它）。
+{
+  const newSessionCalls = [];
+  const fakeConn = {
+    endpoint: { port: 5555, folders: [{ path: '/ws/kiro', label: 'kiro' }] },
+    newSession: async (cwd) => {
+      newSessionCalls.push(cwd);
+      return { sessionId: 'sess_new_1', configOptions: [] };
+    },
+    setConfigOption: async () => ({ configOptions: [] }),
+  };
+  T.setMuxPoolForTest({ pickForWorkspace: () => fakeConn });
+
+  // 场景 A：目标工作区不是本窗口的 → 必须带提示
+  localWsFolders = [{ uri: { fsPath: '/ws/personal' } }];
+  executed.length = 0;
+  const crossed = await T.createSession('/ws/kiro', {});
+  check('跨窗口创建：会话照样建出来（不能因为提示就不干活）',
+    crossed && crossed.sessionId === 'sess_new_1');
+  check('★ 跨窗口创建：带回 notes 说明 agent 实际在哪个工作区干活',
+    !!(crossed.notes && crossed.notes.length), JSON.stringify(crossed.notes || []));
+  check('★ notes 里点名了两个工作区，人能看懂是哪儿对哪儿',
+    !!crossed.notes && /kiro/.test(crossed.notes[0]) && /personal/.test(crossed.notes[0]),
+    crossed.notes ? crossed.notes[0].slice(0, 60) : '');
+  check('仍然调了 attachDesktop（否则这个会话的审批会被立刻取消）',
+    executed.some((e) => e.cmd === 'kiroAgent.viewSession'),
+    executed.map((e) => e.cmd).join(','));
+  check('newSession 收到的 cwd 是用户选的那个（会话确实建在目标工作区）',
+    newSessionCalls[newSessionCalls.length - 1] === '/ws/kiro',
+    `cwd=${newSessionCalls[newSessionCalls.length - 1]}`);
+
+  // 场景 B：目标就是本窗口 → 不能有提示。少了这条反向断言，
+  // 把判断写成恒真也会「通过」，然后每次创建都弹一个无关警告。
+  localWsFolders = [{ uri: { fsPath: '/ws/kiro' } }];
+  const local = await T.createSession('/ws/kiro', {});
+  check('★ 同窗口创建：不带任何提示', !(local.notes && local.notes.length),
+    JSON.stringify(local.notes || []));
+
+  // 路径写法差异不该被误判成跨窗口（尾斜杠、多余的 ./）
+  localWsFolders = [{ uri: { fsPath: '/ws/kiro/' } }];
+  const trailing = await T.createSession('/ws/kiro', {});
+  check('尾斜杠不算跨窗口', !(trailing.notes && trailing.notes.length),
+    JSON.stringify(trailing.notes || []));
+
+  // 没指定工作区时按连接的默认走，也不该报跨窗口
+  localWsFolders = [{ uri: { fsPath: '/ws/personal' } }];
+  const noWs = await T.createSession(undefined, {});
+  check('没指定工作区 → 不报跨窗口', !(noWs.notes && noWs.notes.length),
+    JSON.stringify(noWs.notes || []));
+}
 
 // 收尾：把 HOME 放回去，删掉沙箱
 Module._resolveFilename = origResolve;
