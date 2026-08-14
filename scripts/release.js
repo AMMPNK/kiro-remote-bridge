@@ -209,7 +209,10 @@ ok(`${REQUIRED.length} 个必需文件都在`);
 
 // ---------------------------------------------------------------- 8. 后续动作提示
 console.log(`\n${VERSION} 已就绪。剩下这些需要人做：`);
-console.log('  1. 重载 Kiro 窗口（Reload Window），否则跑的还是旧代码');
+console.log('  1. 重载 Kiro 窗口（Reload Window）—— 必须做，不是可选的：');
+console.log('     上面清理旧版本目录那一步，把正在运行的 relay 所指的 media 目录删掉了。');
+console.log('     relay 每次请求都读盘（不缓存），所以不重载的话手机上打开直接 404。');
+console.log('     实测过：装完不重载，GET /app.html 返回 404。');
 console.log('  2. 按 docs/manual-regression.md 走一遍人工回归');
 console.log('  3. git 提交并打 tag（脚本刻意不做，message 要人写）：');
 console.log(`       git add -p && git commit && git tag v${VERSION}`);

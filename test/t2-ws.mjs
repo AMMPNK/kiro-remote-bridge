@@ -102,6 +102,35 @@ check('收到服务端关闭码 4321',
   c.state === 'closed' && c._closeInfo && c._closeInfo.code === 4321,
   JSON.stringify(c._closeInfo || {}));
 
+// 8c. 心跳的存活标记：收到普通消息就该恢复，不能只认 pong
+//
+// 这是「手机在前台正常用却间歇性断线」的修复落点。文件末尾那组用例验的是判定逻辑
+// （连续几个周期没动静才断），但那些都是拿假对象跑的 —— 把 _onData 里置 _alive 的
+// 那一行删掉，它们照样全绿。所以必须在真连接上验一次。
+{
+  let serverSide = null;
+  const grabbed = new Promise((r) => wss.once('connection', (cn) => { serverSide = cn; r(); }));
+  const live = await connectClient('good');
+  await Promise.race([grabbed, new Promise((r) => setTimeout(r, 2000))]);
+  check('拿到服务端侧的连接对象', !!serverSide);
+  if (serverSide) {
+    serverSide._alive = false; // 假装这一周期还没有任何动静
+    live.c.send('echo:alive-probe');
+    const t0 = Date.now();
+    while (!serverSide._alive && Date.now() - t0 < 3000) {
+      await new Promise((r) => setTimeout(r, 20));
+    }
+    check('★ 真连接上收到一条普通消息，存活标记就恢复（不必等 pong）',
+      serverSide._alive === true, `_alive=${serverSide._alive}`);
+  }
+  live.c.close();
+  // 等服务端把它从连接表里摘掉，否则下面那条「连接表已清空」会被这条连接带红
+  const t1 = Date.now();
+  while (wss.connections.size > 0 && Date.now() - t1 < 3000) {
+    await new Promise((r) => setTimeout(r, 20));
+  }
+}
+
 // 9. 连接数归零
 check('server 连接表已清空', wss.connections.size === 0, `size=${wss.connections.size}`);
 
@@ -174,6 +203,64 @@ check('前端兜底帧上限与服务端一致', fallback === MAX_PAYLOAD,
 check('前端按 hello 里的 maxPayload 重算预算',
   /case 'hello':[\s\S]{0,300}?maxTotalB64 = Math\.floor\(Number\(m\.maxPayload\)/.test(appSrc));
 check('前端不再有写死的 MAX_TOTAL_B64 常量', !/const MAX_TOTAL_B64/.test(appSrc));
+
+// ---------------------------------------------------------------------------
+// 心跳不能误杀活着的连接
+// ---------------------------------------------------------------------------
+// 实测症状：手机在前台正常收发消息，却间歇性显示「已断开，重连中」，而网络没问题。
+// 两个原因叠加：① 存活标记只由 PONG 帧恢复，正常消息帧不算；② 检查与重置在同一个
+// tick 里，实际只容忍一个周期。经 VPN 或移动网络时抖动一下就够触发。
+//
+// 这里不真等 30 秒，直接驱动那个心跳回调 —— 要验的是「什么情况下会 terminate」
+// 这个判定逻辑，不是 setInterval 本身准不准。
+{
+  const { HB_MAX_MISSED, HB_INTERVAL_MS } = require('./src/wsServer.js');
+  check('心跳常量已导出，容忍周期数 >= 2（注释与代码要一致）',
+    HB_MAX_MISSED >= 2 && HB_INTERVAL_MS > 0,
+    `interval=${HB_INTERVAL_MS}ms missed=${HB_MAX_MISSED}`);
+
+  // 造一个最小的假连接，只带心跳需要的那几个字段，然后把心跳回调抠出来跑。
+  // 直接 new WsConnection 需要真 socket，而这里要验的判定逻辑跟 socket 无关。
+  const beat = (conn) => {
+    if (conn.closed) return;
+    if (conn._alive) conn._missedBeats = 0;
+    else if (++conn._missedBeats >= HB_MAX_MISSED) { conn.terminated = true; return; }
+    conn._alive = false;
+    conn.pings = (conn.pings || 0) + 1;
+  };
+  const mk = () => ({ closed: false, _alive: true, _missedBeats: 0, terminated: false, pings: 0 });
+
+  // 场景 A：完全没有任何回应 —— 要连续两个周期才断，不能一个周期就断
+  const dead = mk();
+  beat(dead);
+  check('第一个周期不断开（只是发了 ping）', !dead.terminated && dead.pings === 1);
+  beat(dead);
+  check('第二个周期仍不断开（还在容忍范围内）', !dead.terminated,
+    `missed=${dead._missedBeats}`);
+  beat(dead);
+  check('★ 连续没动静到达上限才断开', dead.terminated);
+
+  // 场景 B：只有正常消息、没有 pong —— 不能被杀。这是修复的核心。
+  const chatty = mk();
+  for (let i = 0; i < 6; i++) {
+    beat(chatty);
+    chatty._alive = true; // 模拟 _onData：收到任意入站字节
+  }
+  check('★ 只有消息往来、一个 pong 都没收到 → 不会被误杀', !chatty.terminated,
+    `跑了 6 个周期 missed=${chatty._missedBeats}`);
+
+  // 场景 C：断断续续 —— 中间恢复一次就应该把计数清零
+  const flaky = mk();
+  beat(flaky);
+  beat(flaky);
+  check('抖动中：两个周期没动静，还没断', !flaky.terminated);
+  flaky._alive = true;
+  beat(flaky);
+  check('★ 中间恢复一次就把累计清零', flaky._missedBeats === 0 && !flaky.terminated);
+  beat(flaky);
+  check('清零后又要重新累计到上限才断', !flaky.terminated);
+
+}
 
 console.log(`\n结果: ${pass} 通过 / ${fail} 失败`);
 process.exit(fail ? 1 : 0);

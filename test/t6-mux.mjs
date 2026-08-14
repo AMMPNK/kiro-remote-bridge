@@ -147,14 +147,27 @@ await wait(200);
 check('入站通知被抛出且未回响应',
   inbound.length === 1 && inbound[0].id === undefined && received.length === 0);
 
-// 8a. 服务端返回 error 时应 reject（而非静默 resolve）
-let errRejected = false;
+// 8a. 服务端返回 error 时应 reject（而非静默 resolve），并且把结构化字段带出来
+//
+// 为什么要断言 err.code：调用方靠错误码分流（-32001 = 该权限已不存在、
+// -32002 = 已有回合在跑），而这两个判据的行为差别很大 —— 一个停止重放，一个自动降级。
+// 此前 reject 的是 `new Error(JSON.stringify(error))`，code 永远 undefined，
+// 于是所有 `err.code === -320xx` 的判断都是死代码，只有正则匹配 message 在起作用。
+// 更糟的是别处的测试用手工构造的 `{ code }` 对象测那些判据，看着有覆盖、实际从没生效。
+// 这一条把真实产出的形态钉住，免得 mock 和真实行为各自漂移。
+let errCaught = null;
 try {
   await conn.request('unknown/method', {}, 3000);
 } catch (e) {
-  errRejected = /32601/.test(e.message);
+  errCaught = e;
 }
-check('error 响应会 reject', errRejected);
+check('error 响应会 reject', !!errCaught && /32601/.test(errCaught.message));
+check('reject 的 Error 带 code（调用方按错误码分流，靠 message 正则不可靠）',
+  !!errCaught && errCaught.code === -32601, errCaught ? `code=${errCaught.code}` : '');
+check('reject 的 Error 带 rpcMessage（原始文案，不含 JSON 包装）',
+  !!errCaught && errCaught.rpcMessage === 'nope', errCaught ? `rpcMessage=${errCaught.rpcMessage}` : '');
+check('message 仍是整个 error 的 JSON（旧的文本兜底判据依赖它）',
+  !!errCaught && /"code"\s*:\s*-32601/.test(errCaught.message));
 
 // 8b. 服务端不响应时应在超时后 reject，不能悬挂
 const t0 = Date.now();

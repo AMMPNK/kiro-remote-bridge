@@ -125,8 +125,27 @@ class MuxConnection extends EventEmitter {
       const p = this.pending.get(msg.id);
       if (!p) return;
       this.pending.delete(msg.id);
-      if (msg.error) p.reject(new Error(JSON.stringify(msg.error).slice(0, 300)));
-      else p.resolve(msg.result);
+      if (msg.error) {
+        /*
+         * 把 JSON-RPC error 的结构化字段挂到 Error 上。
+         *
+         * 原先只有 `new Error(JSON.stringify(msg.error))`，于是 message 里虽然带着
+         * `{"code":-32001,...}` 的字面量，但 `err.code` 永远是 undefined ——
+         * 任何 `err.code === -32001` 的判据都是死代码，只有正则匹配 message 在真正起作用。
+         * 而正则要在一个 JSON 字面量里找子串，稍微改个措辞就失效。
+         *
+         * 这个坑还会污染测试:测试里手工构造 `Object.assign(new Error(''), { code })`
+         * 就能让判据通过，而真实对端给的错误从来没有 code —— mock 比真实情况宽容，
+         * 于是判据看着有测试覆盖，实际在生产里从没生效过。
+         *
+         * message 的格式保持不变，免得动到已有的文本兜底判据。
+         */
+        const e = new Error(JSON.stringify(msg.error).slice(0, 300));
+        if (msg.error && typeof msg.error.code === 'number') e.code = msg.error.code;
+        if (msg.error && msg.error.message) e.rpcMessage = String(msg.error.message);
+        e.rpcError = msg.error;
+        p.reject(e);
+      } else p.resolve(msg.result);
       return;
     }
     // agent → client 的请求或通知

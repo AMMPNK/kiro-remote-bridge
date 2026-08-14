@@ -280,5 +280,76 @@ check('tail 带回最新 status', d.status === 'in_progress', d.status);
 }
 
 fs.rmSync(root, { recursive: true, force: true });
+
+// ---------------------------------------------------------------------------
+// 会话列表去重：同一 sessionId 在多个 workspace 目录下各有一份元数据
+// ---------------------------------------------------------------------------
+// 实测本机 48 个会话里有 2 个这样的重复 —— Kiro 把会话元数据同步到多个 workspace
+// 目录，但 messages.jsonl 只落在真正打开它的那个窗口下，于是另一份只有几百字节的
+// session.json。不去重会让手机端列表出现两条一样的会话，更麻烦的是
+// workspaceOfSession() 用 find 取第一条，可能拿到没有消息数据的那个 workspace，
+// 导致 pickForWorkspace 连错窗口、session/prompt 报 Session not found。
+//
+// 放在这里而不是 t1-store：那个文件读真实数据，CI 上按门禁要求整体 SKIP，
+// 而去重是纯函数，必须在 CI 上也跑到。
+const { dedupeSessions } = require('./src/sessionStore.js');
+{
+  const mk = (o) => ({
+    sessionId: 'sess_dup',
+    title: 't',
+    workspacePaths: [],
+    lastActiveAt: 0,
+    hasMessages: false,
+    ...o,
+  });
+
+  // 核心场景：有消息文件的那份必须胜出，哪怕它的 lastActiveAt 更旧
+  const r1 = dedupeSessions([
+    mk({ dir: '/ws-meta-only/sess_dup', hasMessages: false, lastActiveAt: 2000, workspacePaths: ['/B'] }),
+    mk({ dir: '/ws-real/sess_dup', hasMessages: true, lastActiveAt: 1000, workspacePaths: ['/A'] }),
+  ]);
+  check('同 sessionId 合并成一条', r1.length === 1, `得到 ${r1.length} 条`);
+  check('★ 保留有 messages.jsonl 的那份（dir 会被用来读历史，留错就读不到消息）',
+    r1[0].dir === '/ws-real/sess_dup', `dir=${r1[0].dir}`);
+  check('★ 即使那份的 lastActiveAt 更旧也照样保留它',
+    r1[0].lastActiveAt === 1000, `lastActiveAt=${r1[0].lastActiveAt}`);
+  check('两边的 workspacePaths 都合并进来，不丢候选',
+    r1[0].workspacePaths.includes('/A') && r1[0].workspacePaths.includes('/B'),
+    JSON.stringify(r1[0].workspacePaths));
+
+  // 都没有消息文件时按最近活动取
+  const r2 = dedupeSessions([
+    mk({ dir: '/x/sess_dup', lastActiveAt: 100 }),
+    mk({ dir: '/y/sess_dup', lastActiveAt: 900 }),
+  ]);
+  check('都没有消息文件 → 取最近活动的那份',
+    r2.length === 1 && r2[0].dir === '/y/sess_dup', `dir=${r2[0] && r2[0].dir}`);
+
+  // 都有消息文件时按最近活动取（同一会话被两个窗口都写过的情况）
+  const r3 = dedupeSessions([
+    mk({ dir: '/x/sess_dup', hasMessages: true, lastActiveAt: 900 }),
+    mk({ dir: '/y/sess_dup', hasMessages: true, lastActiveAt: 100 }),
+  ]);
+  check('都有消息文件 → 取最近活动的那份',
+    r3.length === 1 && r3[0].dir === '/x/sess_dup', `dir=${r3[0] && r3[0].dir}`);
+
+  // 不能把不同的会话也合并掉 —— 这是反方向的失效
+  const r4 = dedupeSessions([
+    mk({ sessionId: 'a', dir: '/x/a' }),
+    mk({ sessionId: 'b', dir: '/x/b' }),
+    mk({ sessionId: 'c', dir: '/x/c' }),
+  ]);
+  check('不同 sessionId 一条都不少', r4.length === 3, `得到 ${r4.length} 条`);
+  check('空数组不炸', dedupeSessions([]).length === 0);
+
+  // workspacePaths 合并时不能产生重复项
+  const r5 = dedupeSessions([
+    mk({ dir: '/x/sess_dup', hasMessages: true, workspacePaths: ['/same'] }),
+    mk({ dir: '/y/sess_dup', hasMessages: false, workspacePaths: ['/same'] }),
+  ]);
+  check('合并 workspacePaths 时去重', r5[0].workspacePaths.length === 1,
+    JSON.stringify(r5[0].workspacePaths));
+}
+
 console.log(`\n结果: ${pass} 通过 / ${fail} 失败`);
 process.exit(fail ? 1 : 0);

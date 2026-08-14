@@ -18,6 +18,14 @@ const OP_CONT = 0x0;
 const OP_TEXT = 0x1;
 const OP_BINARY = 0x2;
 const OP_CLOSE = 0x8;
+/**
+ * 心跳间隔与容忍的周期数。提出来是为了让测试能不真等 30 秒就验到「连续两个周期
+ * 没动静才断」这个行为 —— 那是这两个值唯一值得测的地方，写死在 setInterval 里
+ * 就只能靠读代码确认。
+ */
+const HB_INTERVAL_MS = 30000;
+const HB_MAX_MISSED = 2;
+
 const OP_PING = 0x9;
 const OP_PONG = 0xa;
 /** 单帧上限，防止恶意超大 payload 打爆内存 */
@@ -73,17 +81,37 @@ class WsConnection extends EventEmitter {
     });
     socket.on('close', () => this._finish());
 
-    // 心跳：30s 一次 ping，2 个周期无 pong 视为断开
+    /*
+     * 心跳：每 HB_INTERVAL_MS 发一次 ping，连续 HB_MAX_MISSED 个周期没有任何动静才断开。
+     *
+     * 这里原先有两个问题，合起来会误杀正常连接（实测症状：手机在前台好好用着，
+     * 却间歇性显示「已断开，重连中」，而网络本身没问题）：
+     *
+     * ① 注释写着「2 个周期无 pong 视为断开」，代码却是检查和重置在同一个 tick 里 ——
+     *    发完 ping 立刻把 _alive 置 false，下一次检查就在 30 秒后。**实际容忍度只有
+     *    一个周期**。经 VPN 或移动网络时，隧道抖动一下、或者手机切换基站，
+     *    30 秒就可能过不去。
+     * ② _alive 只由 PONG 帧恢复，**正常的消息帧不算**。于是一条正在收发数据的连接
+     *    也可能因为单个 pong 没赶上而被杀掉 —— 判据错了：要判的是「这条连接还有没有
+     *    活动」，而不是「有没有收到 pong」。pong 只是在没有别的流量时用来探活的手段。
+     *
+     * 现在两条都改了：任何入站帧都算活着（见 _handleFrame），且要连续两个周期
+     * 彻底没动静才断。代价是死连接最多多占 30 秒，对单用户的本机工具无所谓；
+     * 而误杀的代价是用户可见的断线重连，两者不对称。
+     */
     this._alive = true;
+    this._missedBeats = 0;
     this._hb = setInterval(() => {
       if (this.closed) return;
-      if (!this._alive) {
+      if (this._alive) {
+        this._missedBeats = 0;
+      } else if (++this._missedBeats >= HB_MAX_MISSED) {
         this.terminate();
         return;
       }
       this._alive = false;
       this.ping();
-    }, 30000);
+    }, HB_INTERVAL_MS);
   }
 
   _finish() {
@@ -94,6 +122,14 @@ class WsConnection extends EventEmitter {
   }
 
   _onData(chunk) {
+    /*
+     * 收到任何字节都说明这条连接还活着 —— 判据放在这里而不是逐个帧类型里处理，
+     * 是为了不漏：将来加新的 opcode 分支也自动算作活动。
+     *
+     * 这一行是「前台正常使用时也会间歇性断线」的修复关键：此前只有 PONG 帧会
+     * 重置存活标记，一条正在收发消息的连接照样可能被心跳判死。
+     */
+    this._alive = true;
     this._buf = Buffer.concat([this._buf, chunk]);
     for (;;) {
       const frame = this._readFrame();
@@ -157,6 +193,8 @@ class WsConnection extends EventEmitter {
         this._sendRaw(OP_PONG, payload);
         return;
       case OP_PONG:
+        // pong 只是「没有别的流量时」的探活手段，不是唯一的存活证据 ——
+        // 每个入站帧都会在 _onData 里把 _alive 置 true，见那里的说明。
         this._alive = true;
         return;
       case OP_CLOSE:
@@ -321,4 +359,4 @@ class WsServer extends EventEmitter {
 
 // MAX_PAYLOAD 导出，让上层能把真实上限告诉手机端 —— 客户端此前是自己写死一个
 // 6MB 的预算，与这里的 8MB 只靠注释关联，改一处另一处会静默失配。
-module.exports = { WsServer, WsConnection, MAX_PAYLOAD };
+module.exports = { WsServer, WsConnection, MAX_PAYLOAD, HB_INTERVAL_MS, HB_MAX_MISSED };

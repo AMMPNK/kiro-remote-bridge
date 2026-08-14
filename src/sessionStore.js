@@ -91,6 +91,52 @@ function toEpoch(iso) {
   return Number.isFinite(t) ? t : 0;
 }
 
+/**
+ * 同一个 sessionId 在多个 workspace 目录下各有一份 session.json 时，合并成一条。
+ *
+ * 为什么会有多份：Kiro 把会话**元数据**同步到多个 workspace 目录，但 `messages.jsonl`
+ * 只落在真正打开这个会话的那个窗口下。实测本机 48 个会话里有 2 个这样的重复，
+ * 其中一份只有 `session.json`（几百字节）、完全没有消息文件。
+ * （`listSessions` 里那句「没有 messages.jsonl 的会话仍然列出」说的就是这些副本，
+ * 当时没认出它们其实是同一个会话。）
+ *
+ * 不去重的两个后果：
+ *   - 手机端列表出现两条一模一样的会话，点哪条都一样。
+ *   - `workspaceOfSession()` 用 `find` 取第一条，可能挑到**没有消息数据**的那个
+ *     workspace，于是 `pickForWorkspace` 连到错误的窗口，`session/prompt` 报
+ *     Session not found。
+ *
+ * 保留哪一份：**有 messages.jsonl 的那份优先**，因为 item 里的 `dir` 会被用来读历史，
+ * 留错了就读不到消息。都有或都没有时取最近活动的那份。
+ * 另一份的 `workspacePaths` 会合并进来，不丢候选（将来若要「逐个窗口试」用得上）。
+ */
+function dedupeSessions(items) {
+  const byId = new Map();
+  for (const it of items) {
+    const prev = byId.get(it.sessionId);
+    if (!prev) {
+      byId.set(it.sessionId, it);
+      continue;
+    }
+    let keep, drop;
+    if (!!it.hasMessages !== !!prev.hasMessages) {
+      keep = it.hasMessages ? it : prev;
+      drop = it.hasMessages ? prev : it;
+    } else if (it.lastActiveAt > prev.lastActiveAt) {
+      keep = it;
+      drop = prev;
+    } else {
+      keep = prev;
+      drop = it;
+    }
+    const merged = [...(keep.workspacePaths || [])];
+    for (const p of drop.workspacePaths || []) if (!merged.includes(p)) merged.push(p);
+    keep.workspacePaths = merged;
+    byId.set(it.sessionId, keep);
+  }
+  return [...byId.values()];
+}
+
 function firstLine(text, max = 120) {
   const s = String(text || '')
     .replace(/\s+/g, ' ')
@@ -171,13 +217,19 @@ class SessionStore {
       const jsonl = path.join(dir, 'messages.jsonl');
       let mtimeMs = toEpoch(meta.lastModifiedAt);
       let size = 0;
+      let hasMessages = false;
       try {
         const st = fs.statSync(jsonl);
         // 文件 mtime 比 session.json 里的 lastModifiedAt 更实时
         mtimeMs = Math.max(mtimeMs, st.mtimeMs);
         size = st.size;
+        hasMessages = true;
       } catch (_) {
-        /* 没有 messages.jsonl 的会话（1/64）仍然列出 */
+        /*
+         * 没有 messages.jsonl 的会话仍然列出（可能是刚建还没说话的）。
+         * 但要记下这个事实：这类目录里有一部分其实是「同一会话在别的 workspace 下的
+         * 元数据副本」，去重时必须优先保留有消息文件的那一份，见 dedupeSessions。
+         */
       }
 
       const wsPaths = Array.isArray(meta.workspacePaths) ? meta.workspacePaths : [];
@@ -198,10 +250,14 @@ class SessionStore {
         createdAt: toEpoch(meta.createdAt),
         lastActiveAt: mtimeMs,
         bytes: size,
+        hasMessages,
       });
     }
-    items.sort((a, b) => b.lastActiveAt - a.lastActiveAt);
-    return items;
+    // 先去重再排序：去重会改 workspacePaths，但不会改 lastActiveAt，顺序无所谓；
+    // 放在排序前是因为排序后的数组更容易让人误以为「相邻的才可能重复」。
+    const unique = dedupeSessions(items);
+    unique.sort((a, b) => b.lastActiveAt - a.lastActiveAt);
+    return unique;
   }
 
   /**
@@ -773,4 +829,6 @@ class SessionStore {
   }
 }
 
-module.exports = { SessionStore, SESSIONS_ROOT };
+// dedupeSessions 导出供测试：它是纯函数，直接喂构造好的 item 比在磁盘上造两个
+// workspace 目录快得多，也不用改 HOME（SESSIONS_ROOT 在 require 时就固定了）。
+module.exports = { SessionStore, SESSIONS_ROOT, dedupeSessions };

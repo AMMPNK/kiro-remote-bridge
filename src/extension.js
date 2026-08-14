@@ -706,6 +706,25 @@ function isPromptInFlight(err) {
   return /already in-flight|already in progress/i.test(msg) || err.code === -32002;
 }
 
+/**
+ * 判断错误是否为「agent 那边没有这个待处理权限」（JSON-RPC -32001）。
+ *
+ * 这是一个**确定信号**：agent 明确表示它的 pending 表里没有这个 toolCallId，
+ * 所以再提交多少次都不会有别的结果。据此可以把记录标记掉、停止重放。
+ *
+ * 判据同时看两处，因为两处都可能失效：
+ *   - `err.code` —— muxClient 现在会把 JSON-RPC error 的 code 挂到 Error 上。
+ *   - message 里的字面量 —— message 是整个 error 对象的 JSON 序列化，
+ *     所以 `"code":-32001` 和 `No pending permission` 都会出现在里面。
+ *     留着它是为了兼容旧行为，以及万一 code 字段哪天又拿不到。
+ */
+function isNoPendingPermission(err) {
+  if (!err) return false;
+  if (err.code === -32001) return true;
+  const msg = String(err.message || err);
+  return /no pending permission/i.test(msg) || /"code"\s*:\s*-32001\b/.test(msg);
+}
+
 /** in-flight 报错时给用户的自救说明。文案集中在一处，避免几个出口写得不一样。 */
 const IN_FLIGHT_HINT =
   '该会话上有一轮对话还没结束，所以拒绝了新消息。' +
@@ -1078,7 +1097,35 @@ async function respondPermission(toolCallId, approve, wantOptionId = null) {
           `这个请求已经在别处处理过了（${settled.selectedOption || settled.outcome}），你这次点击没有生效。`
         );
       }
-      // 只有确认它还活着才允许重试。失败要如实说，不能让手机端以为批准了。
+      /*
+       * 第三种情况：文件里查不到结局，但 agent 明确说「没有这个 pending」（-32001）。
+       *
+       * 这时**不能允许重试**。上面那条文件核对只覆盖了「结局已经写进文件」的情形，
+       * 而 agent 侧的 pending 消失还有别的走法，它们都不会留下 interaction_resolved：
+       *   - agent 进程重启 / 窗口 reload，内存里的 pending 表整个丢了
+       *   - 那一轮被取消，请求随之作废
+       *   - 结局确实写了，但落在 resolvedOutcomes() 只读的尾部 1MB 之外
+       * 三种都表现为「文件里查不到」，而旧逻辑据此推论「它还活着，可以重试」——
+       * 这个推论是错的。实测后果：清零 respondedAt 让这条记录重新算作「还在等你」，
+       * 于是每次进会话都重放一个死掉的授权框，**点多少次失败多少次，永远清不掉**。
+       *
+       * -32001 本身就是确定信号：agent 那边没有这个 toolCallId 的待处理权限，
+       * 再提交一万次也不会有别的结果。所以标记掉，让它不再被重放。
+       *
+       * 代价要说清楚：如果 agent 其实还在等这个审批（只是它自己的记账错乱了），
+       * 标记之后手机上就批不了了。但那种情况下手机本来也批不动（-32001 挡着），
+       * 真正的出路是去电脑上点 —— 错误文案里写明了这条。
+       */
+      if (isNoPendingPermission(err)) {
+        markPermissionResolved(toolCallId, 'stale');
+        throw new Error(
+          'Kiro 那边已经没有这个授权请求了（可能它重载过、那一轮被取消了，' +
+            '或者已经在电脑上处理过）。这个框不会再弹，你不用再点。' +
+            '如果那件事还需要放行，去电脑上看一眼那个会话。'
+        );
+      }
+      // 其他失败可能是暂时的（超时、连接抖动），允许重试。
+      // 失败要如实说，不能让手机端以为批准了。
       rec.respondedAt = 0;
       throw new Error(`提交失败：${msg}`);
     }
@@ -1566,6 +1613,7 @@ module.exports = {
     isDefinitelyNotDelivered,
     isPromptInFlight,
     isSessionUnknown,
+    isNoPendingPermission,
     setMuxPoolForTest: (p) => { muxPool = p; },
     // 把两个等待窗口调小，否则每个失败场景都要真等 2 秒（not found 那条还要等两次加 attach）
     setSettleForTest: (send, attach) => {

@@ -73,14 +73,36 @@ const fakeConn = {
   // 必须调 _kiro/permission/respond。
   respondPermission: async (sessionId, toolCallId, optionId, scope) => {
     if (failNextRespond) {
+      const e = failNextRespond;
       failNextRespond = false;
-      throw new Error('agent rejected');
+      throw e === true ? new Error('agent rejected') : e;
     }
     sent.push({ kind: 'extMethod', sessionId, toolCallId, optionId, scope: scope || null });
     return {};
   },
 };
+// true = 抛一个笼统错误；也可以直接赋一个 Error 对象来指定具体形态
 let failNextRespond = false;
+
+/**
+ * 照 muxClient 的**真实产出**造一个 JSON-RPC 错误。
+ *
+ * 为什么必须照着真实形态造：muxClient 收到 error 响应时，把整个 error 对象
+ * JSON 序列化当 message，同时把 code 挂到 Error 上。这两点都会被判据用到。
+ *
+ * 这里踩过一次：原先这个文件用 `new Error('agent rejected')` 模拟「agent 回 -32001」
+ * （注释和代码不一致），于是「-32001 时不该允许重试」这个缺口在测试里完全看不出来 ——
+ * mock 造的错误比真实对端给的更"干净"，判据就永远碰不到真实分支。
+ * t6-mux 里有一条断言锁住 muxClient 确实这样产出，两边形态不会各自漂移。
+ */
+function rpcError(code, message) {
+  const payload = { code, message };
+  const e = new Error(JSON.stringify(payload).slice(0, 300));
+  e.code = code;
+  e.rpcMessage = message;
+  e.rpcError = payload;
+  return e;
+}
 
 /** 照真实数据的形状造一个 tool_approval 权限请求 */
 const REAL_OPTIONS = [
@@ -539,7 +561,8 @@ check('没有待处理时回空数组而不是 undefined',
     params: { sessionId: SID, toolCallId: 'tc-already', title: 'Write File', options: REAL_OPTIONS },
   });
 
-  failNextRespond = true; // 模拟 agent 回 -32001 No pending permission
+  // 真实形态：agent 回 -32001，且文件里这条已经有结局 → 应该报准确结局
+  failNextRespond = rpcError(-32001, `No pending permission for toolCallId: tc-already`);
   let err = null;
   try {
     await respondPermission('tc-already', true, 'accept');
@@ -552,27 +575,82 @@ check('没有待处理时回空数组而不是 undefined',
     !!(pendingPermissions.get('tc-already') || {}).resolvedAt);
   check('★ 这条不会再出现在重放列表里', pendingPermissionsFor(SID).length === 0);
 
-  // 对照：文件里没有结局时，仍然要允许重试（不能把所有失败都当成已处理）
+  /*
+   * -32001 且文件里查不到结局 —— 这是实测踩到的那个死循环。
+   *
+   * agent 侧 pending 消失有好几种走法不会留下 interaction_resolved：进程重启、
+   * 窗口 reload、那一轮被取消、或者结局落在 resolvedOutcomes() 只读的尾部 1MB 之外。
+   * 旧逻辑把「文件里查不到」推论成「它还活着，可以重试」，于是清零 respondedAt，
+   * 这条记录重新算「还在等你」→ 每次进会话都重放 → 点多少次失败多少次。
+   * 用户实测：手机上点了两次都清不掉，切到列表再回来照样弹。
+   */
+  onMuxInbound({
+    method: 'session/request_permission',
+    id: 504,
+    connection: fakeConn,
+    params: { sessionId: SID, toolCallId: 'tc-gone', title: 'Run Command', options: REAL_OPTIONS },
+  });
+  failNextRespond = rpcError(-32001, 'No pending permission for toolCallId: tc-gone');
+  let errGone = null;
+  try {
+    await respondPermission('tc-gone', true, 'accept');
+  } catch (e) {
+    errGone = e;
+  }
+  check('★ -32001 且文件里没有结局 → 说明它在 agent 那边已经不存在，不是「等你重试」',
+    !!errGone && /已经没有这个授权请求/.test(errGone.message),
+    errGone ? errGone.message.slice(0, 50) : '没抛错');
+  check('★ 标成已解决（outcome=stale）',
+    (pendingPermissions.get('tc-gone') || {}).outcome === 'stale',
+    `outcome=${(pendingPermissions.get('tc-gone') || {}).outcome}`);
+  check('★ 不再被重放 —— 这是死循环的出口',
+    !pendingPermissionsFor(SID).some((p) => p.toolCallId === 'tc-gone'));
+  // 真的再点一次。断言「状态没退回去」必须走一遍那条路，
+  // 光把前面验过的字段重新组合一遍是恒真的，测不出东西。
+  sent = [];
+  let errAgain = null;
+  try {
+    await respondPermission('tc-gone', true, 'accept');
+  } catch (e) {
+    errAgain = e;
+  }
+  check('★ 再点一次报「已被处理」，不会退回可重试状态，也不再向 agent 发东西',
+    !!errAgain && sent.length === 0 &&
+      !pendingPermissionsFor(SID).some((p) => p.toolCallId === 'tc-gone'),
+    errAgain ? errAgain.message.slice(0, 40) : '没抛错');
+
+  // 对照：**不是** -32001 的失败（超时、连接抖动）仍然要允许重试。
+  // 少了这条对照，把所有失败都当成「已失效」会让暂时性故障永久吃掉一个审批。
   onMuxInbound({
     method: 'session/request_permission',
     id: 503,
     connection: fakeConn,
     params: { sessionId: SID, toolCallId: 'tc-live', title: 'Write File', options: REAL_OPTIONS },
   });
-  failNextRespond = true;
+  failNextRespond = new Error('request _kiro/permission/respond timed out after 15000ms');
   let err2 = null;
   try {
     await respondPermission('tc-live', true, 'accept');
   } catch (e) {
     err2 = e;
   }
-  check('文件里没有结局时仍报「提交失败」并允许重试',
+  check('非 -32001 的失败仍报「提交失败」并允许重试',
     !!err2 && /提交失败/.test(err2.message) &&
       !(pendingPermissions.get('tc-live') || {}).resolvedAt &&
       !(pendingPermissions.get('tc-live') || {}).respondedAt,
-    err2 ? err2.message : '没抛错');
+    err2 ? err2.message.slice(0, 50) : '没抛错');
   check('允许重试的那条仍会被重放（还在等人批）',
     pendingPermissionsFor(SID).some((p) => p.toolCallId === 'tc-live'));
+
+  // 判据本身：只认 -32001，不能把别的错误也当成「已失效」
+  const isGone = ext.__test.isNoPendingPermission;
+  check('判据：真实形态的 -32001 能认出来', isGone(rpcError(-32001, 'No pending permission')) === true);
+  check('判据：只有 message 带字面量、没有 code 也能认出（旧行为兜底）',
+    isGone(new Error('{"code":-32001,"message":"No pending permission for toolCallId: x"}')) === true);
+  check('判据：超时不算', isGone(new Error('request timed out after 15000ms')) === false);
+  check('判据：in-flight 不算（那是另一个码）',
+    isGone(rpcError(-32002, 'A prompt is already in-flight')) === false);
+  check('判据：空值不算', isGone(null) === false && isGone(undefined) === false);
 }
 
 // ---------------------------------------------------------------- 收尾
