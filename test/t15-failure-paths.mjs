@@ -160,6 +160,41 @@ occupied.close();
 // 漏了这一句的后果很隐蔽 —— 模块级的 relay 变量还指着一个没在监听的实例，
 // 下次点「开启远程会话」会被开头的 if (relay) 挡住，提示「已在运行」，
 // 而实际上什么都没跑，用户会以为服务开着。
+// ---------------------------------------------------------------------------
+// 窗口的增减必须被持续发现，不能只在启动时连一次
+// ---------------------------------------------------------------------------
+// 实测故障：关掉一个 IDE 窗口再重开，它的 mux 端口就变了。而 muxPool 原先只在 Bridge
+// 启动时 refresh 一次，于是旧连接已断、新端口没人去连 —— 那个工作区从手机上**永久**
+// 消失，而且不会自愈。实测现场：endpoints 文件 5.5 小时没更新过。
+//
+// 影响面不止「新建会话能选哪些工作区」：会话操作靠 pickForWorkspace 找到拥有该会话的
+// 连接，找不到就报 Session not found。所以这是常态维护。
+{
+  check('★ 轮询里有独立的 mux 重新发现定时器',
+    /muxTimer = setInterval/.test(extSrc));
+  check('★ 它调 muxPool.refresh()（而不是只读缓存的端点列表）',
+    /muxTimer = setInterval[\s\S]{0,600}muxPool\.refresh\(\)/.test(extSrc));
+  check('stopPolling 会清掉它（否则停止后还在后台连窗口）',
+    /function stopPolling\(\)[\s\S]{0,300}muxTimer/.test(extSrc));
+  // 频率要明显低于会话列表：refresh 要建 WebSocket，每 5 秒来一次是浪费
+  check('刷新间隔比会话列表间隔长（refresh 比读目录贵得多）', (() => {
+    const mux = /const MUX_REFRESH_INTERVAL_MS = (\d+)/.exec(extSrc);
+    const list = /const LIST_INTERVAL_MS = (\d+)/.exec(extSrc);
+    return !!mux && !!list && Number(mux[1]) > Number(list[1]);
+  })(),
+    `mux=${(/const MUX_REFRESH_INTERVAL_MS = (\d+)/.exec(extSrc) || [, '?'])[1]}ms ` +
+      `list=${(/const LIST_INTERVAL_MS = (\d+)/.exec(extSrc) || [, '?'])[1]}ms`);
+  // 用户主动打开面板时要即时刷一次，不让他等周期
+  const wsHandler = /'workspaces:list': async \(\) => \{[\s\S]*?\n    \}/.exec(extSrc);
+  check('能定位 workspaces:list handler', !!wsHandler);
+  if (wsHandler) {
+    check('★ 打开新建会话面板时按需刷一次（不让用户等下一个周期）',
+      /muxPool\.refresh\(\)/.test(wsHandler[0]));
+    check('★ 刷新失败时返回现有连接，不是整个报错',
+      /catch/.test(wsHandler[0]) && /out/.test(wsHandler[0]));
+  }
+}
+
 // 抢端口这段被抽成了 becomeMain（升主时要复用同一条路），所以按**函数**定位，
 // 不按「start 里的 catch 块」定位 —— 后者一重构就失效，而它要守的行为没变。
 const mainFn = /async function becomeMain\([\s\S]*?\n\}/.exec(extSrc);

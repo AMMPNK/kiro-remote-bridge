@@ -59,12 +59,25 @@ const port = server.address().port;
 
 // mock 出 vscode 的命令面
 let endpointMode = 'ok';
+/** endpointMode='moved' 时上报的新端口（模拟窗口重开后换了端口） */
+let movedPort = 0;
 const fakeVscode = {
   commands: {
     executeCommand: async (cmd) => {
       if (cmd !== 'kiro.agentRegistry.getAgentEndpoints') throw new Error('unexpected cmd ' + cmd);
       if (endpointMode === 'throw') throw new Error('command not found');
       if (endpointMode === 'garbage') return { nope: true };
+      // 同一个 windowId 换了端口：IDE 窗口关掉再重开就是这个形态
+      if (endpointMode === 'moved') {
+        return [
+          {
+            port: movedPort,
+            token: GOOD_TOKEN,
+            windowId: 'win-1',
+            folders: [{ label: 'Kiro', path: '/tmp/wsA' }],
+          },
+        ];
+      }
       return [
         { port, token: GOOD_TOKEN, windowId: 'win-1', folders: [{ label: 'Kiro', path: '/tmp/wsA' }] },
       ];
@@ -201,6 +214,64 @@ check('返回值非数组时安全降级', r.endpointCount === 0 && pool.endpoin
 endpointMode = 'ok';
 r = await pool.refresh();
 check('恢复后可重新建连', r.connectedCount === 1, JSON.stringify(r));
+
+// 12b. 同一个窗口换了端口 —— 关掉 IDE 窗口再重开就是这个形态
+//
+// 实测故障：关掉一个工作区窗口再打开，它的 mux 端口变了。refresh 必须**同时**做两件事：
+// 连上新端口、丢掉旧端口。只做前者会留一条永远连不上的幽灵连接（工作区列表里多出一个
+// 点不动的条目），只做后者则那个工作区从列表里消失。
+//
+// 这条之所以值得单独写：前面第 9 条测的是"端点消失"、第 12 条测的是"从异常中恢复"，
+// 都不是"换端口"。而换端口恰恰是真实高发场景 —— 端点数量不变，所以只看
+// endpointCount / connectedCount 的断言完全看不出问题。
+{
+  // 另起一个服务端，模拟"同一个窗口重开后监听在新端口"
+  const server2 = http.createServer((req, res) => res.writeHead(404).end());
+  const wss2 = new WsServer();
+  server2.on('upgrade', (req, socket) => {
+    const ok = new URL(req.url, 'http://x').searchParams.get('token') === GOOD_TOKEN;
+    wss2.handleUpgrade(req, socket, () => ok);
+  });
+  wss2.on('connection', (c) => {
+    c.on('message', (t) => {
+      let m;
+      try { m = JSON.parse(t); } catch (_) { return; }
+      if (m.method === 'initialize') c.sendJson({ jsonrpc: '2.0', id: m.id, result: {} });
+    });
+  });
+  await new Promise((r2) => server2.listen(0, '127.0.0.1', r2));
+  const port2 = server2.address().port;
+
+  const oldPort = port;
+  endpointMode = 'moved';
+  movedPort = port2;
+  const rMoved = await pool.refresh();
+  check('★ 窗口换端口后：连上新端口',
+    pool.connections.has(port2), `connections=${[...pool.connections.keys()].join(',')}`);
+  check('★ 窗口换端口后：丢掉旧端口（不留连不上的幽灵连接）',
+    !pool.connections.has(oldPort), `旧端口 ${oldPort} 仍在=${pool.connections.has(oldPort)}`);
+  check('连接总数仍是 1（不是新旧并存）',
+    rMoved.connectedCount === 1, JSON.stringify(rMoved));
+  // 换端口后必须真的能用，否则"连上了"只是记账正确
+  const c2 = pool.anyReady();
+  check('★ 新连接真的可用（能拿到 ready 的连接）', !!c2 && c2.endpoint.port === port2,
+    c2 ? `port=${c2.endpoint.port}` : '拿不到');
+
+  /*
+   * 收尾必须把池刷回原来那个端点。
+   *
+   * 这一段是后来插进来的，而它会把 pool 的连接留在 port2 上 —— 后面「diagnostics
+   * 结构完整」那条断言的是原端口，于是被我这个新用例带红了。
+   * 顺序耦合的测试就是这样：新增用例不该改变后续用例的前提。
+   */
+  endpointMode = 'ok';
+  await pool.refresh();
+  wss2.closeAll();
+  server2.close();
+  check('收尾后池已刷回原端点（不影响后续用例的前提）',
+    pool.connections.has(port) && !pool.connections.has(port2),
+    `connections=${[...pool.connections.keys()].join(',')}`);
+}
 
 // 13. 诊断输出结构完整
 const diag = pool.diagnostics();

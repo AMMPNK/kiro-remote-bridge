@@ -64,6 +64,14 @@ let SEND_SETTLE_MS = 2000;
 let ATTACH_SETTLE_MS = 1500;
 /** 会话列表与状态的刷新间隔 */
 const LIST_INTERVAL_MS = 5000;
+/**
+ * 重新发现 IDE 窗口的间隔。
+ *
+ * 比会话列表低频得多是刻意的：refresh 要建 WebSocket 连接，而窗口的开关是人的动作、
+ * 以分钟计，每 5 秒扫一遍纯属浪费。20 秒的意思是「关掉窗口再重开，最迟 20 秒后
+ * 手机上就能看到」——而用户主动打开新建会话面板时还会额外刷一次，那条路是即时的。
+ */
+const MUX_REFRESH_INTERVAL_MS = 20000;
 
 let output;
 let store;
@@ -72,6 +80,7 @@ let relay;
 let statusBar;
 let tailTimer;
 let listTimer;
+let muxTimer;
 /**
  * 手机端打开的会话记在**连接上**（conn.watchedSessionId），不再是一个全局值。
  *
@@ -264,8 +273,23 @@ function buildHandlers() {
       return { type: 'created', ...r };
     },
 
-    /** 可创建会话的工作区列表（取自已连上的 IDE 窗口） */
+    /**
+     * 可创建会话的工作区列表（取自已连上的 IDE 窗口）。
+     *
+     * 进来先 refresh 一次 mux 连接。这个 handler 是**用户主动打开「新建会话」面板**时
+     * 才调的，低频、而且他正等着看结果 —— 宁可多花几十毫秒，也不要给他一份过期的列表。
+     *
+     * 实测故障：关掉一个 IDE 窗口再重开，它的 mux 端口变了，而 muxPool 只在 Bridge
+     * 启动时连过一次，于是列表里那个工作区**永久消失**（旧连接已断，新端口没人去连）。
+     * 用户看到的是"我明明把那个项目开着，手机上却没有它"。
+     */
     'workspaces:list': async () => {
+      try {
+        await muxPool.refresh();
+      } catch (err) {
+        // 刷新失败就用现有连接凑一份，总比直接报错好
+        log(`[workspaces] 刷新 mux 连接失败，返回当前已知的: ${err && err.message}`);
+      }
       const out = [];
       for (const c of muxPool.connections.values()) {
         if (!c.ready) continue;
@@ -1434,13 +1458,44 @@ function startPolling() {
       log(`[list] 失败: ${err && err.message}`);
     }
   }, LIST_INTERVAL_MS);
+
+  /*
+   * 周期性重新发现 IDE 窗口。
+   *
+   * 为什么必须有：窗口的开关会改变 mux 端口，而原先 muxPool 只在 Bridge 启动时连一次。
+   * 于是关掉一个窗口再重开，它的新端口没人去连、旧连接已断 —— 那个工作区就**永久**
+   * 从手机上消失了，而且不会自愈。新开的窗口同理，压根不会被发现。
+   *
+   * 它管的不只是「新建会话时能选哪些工作区」：会话操作要靠 pickForWorkspace 找到
+   * 拥有该会话的那个连接，找不到就报 Session not found。所以这是常态维护，不是
+   * 只为那个面板服务的。
+   *
+   * 频率刻意比会话列表低得多：refresh 要建 WebSocket 连接，每 5 秒来一次纯属浪费，
+   * 而窗口开关是人的动作、以分钟计。用户主动打开「新建会话」面板时还会额外刷一次
+   * （见 workspaces:list），所以他能立刻看到最新的，不用等这个周期。
+   */
+  muxTimer = setInterval(async () => {
+    if (!relay) return;
+    try {
+      const before = muxPool.connections.size;
+      const r = await muxPool.refresh();
+      if (r.connectedCount !== before) {
+        log(`[mux] 重新发现：端点 ${r.endpointCount} 个，已连接 ${r.connectedCount}（之前 ${before}）`);
+        writeEndpoints();
+      }
+    } catch (err) {
+      log(`[mux] 周期刷新失败（下一轮再试）: ${err && err.message}`);
+    }
+  }, MUX_REFRESH_INTERVAL_MS);
 }
 
 function stopPolling() {
   if (tailTimer) clearInterval(tailTimer);
   if (listTimer) clearInterval(listTimer);
+  if (muxTimer) clearInterval(muxTimer);
   tailTimer = null;
   listTimer = null;
+  muxTimer = null;
 }
 
 // ---------------------------------------------------------------- 自诊断
