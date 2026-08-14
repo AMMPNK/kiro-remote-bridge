@@ -160,19 +160,58 @@ occupied.close();
 // 漏了这一句的后果很隐蔽 —— 模块级的 relay 变量还指着一个没在监听的实例，
 // 下次点「开启远程会话」会被开头的 if (relay) 挡住，提示「已在运行」，
 // 而实际上什么都没跑，用户会以为服务开着。
+// 抢端口这段被抽成了 becomeMain（升主时要复用同一条路），所以按**函数**定位，
+// 不按「start 里的 catch 块」定位 —— 后者一重构就失效，而它要守的行为没变。
+const mainFn = /async function becomeMain\([\s\S]*?\n\}/.exec(extSrc);
+check('能定位 becomeMain（抢端口 + 主实例初始化）', !!mainFn);
+if (mainFn) {
+  check('EADDRINUSE 时把 relay 置回 null（否则下次启动会被误判为已在运行）',
+    /relay = null;[\s\S]{0,120}EADDRINUSE/.test(mainFn[0]));
+  check('端口被占时返回 false 而不是抛错（调用方据此决定去当从属）',
+    /EADDRINUSE'?\)?\s*return false/.test(mainFn[0].replace(/\s+/g, ' ')) ||
+      /EADDRINUSE[\s\S]{0,40}return false/.test(mainFn[0]));
+  check('非 EADDRINUSE 的失败仍然上抛（不能把权限/地址问题也当成"有人占了"）',
+    /throw err/.test(mainFn[0]));
+  // 升主必须复用这一整条路。少了任何一步都会得到"能连上但不干活"的半残主实例，
+  // 而那种状态从手机上看和正常的一模一样，只是列表不更新、机器还会睡。
+  check('★ becomeMain 里做齐了主实例该做的事（保活 / mux / 轮询）',
+    /keepAwake\(\)/.test(mainFn[0]) && /muxPool\.refresh\(\)/.test(mainFn[0]) &&
+      /startPolling\(\)/.test(mainFn[0]));
+}
+
 const startFn = /async function start\(context\) \{[\s\S]*?\n\}/.exec(extSrc);
 check('能定位 start(context)', !!startFn);
 if (startFn) {
-  const catchBlock = /catch \(err\) \{[\s\S]*?EADDRINUSE[\s\S]*?\n  \}/.exec(startFn[0]);
-  check('EADDRINUSE 分支存在', !!catchBlock);
-  if (catchBlock) {
-    check('catch 里把 relay 置回 null（否则下次启动会被误判为已在运行）',
-      /relay\s*=\s*null/.test(startFn[0].slice(0, catchBlock.index + catchBlock[0].length)));
-    check('EADDRINUSE 时提前 return，不继续走 keepAwake / refresh',
-      /return;/.test(catchBlock[0]));
-    check('提示里说明了「另一个窗口已覆盖全部会话」而不是只报失败',
-      /覆盖|照常能操作|不需要在这里再开/.test(catchBlock[0]));
-  }
+  check('成为主实例就直接返回，不再走从属那一套', /if \(becameMain\) return;/.test(startFn[0]));
+  check('端口被占时会尝试连回主实例待命（而不是只提示一句就完事）',
+    /startFollower\(/.test(startFn[0]));
+  /*
+   * 待命成功与失败必须给出**不一样的**提示。
+   * 实测踩过：两种结局都只弹「端口已被占用」，而那句话从更早的版本就有 ——
+   * 用户在第二个窗口开了 Bridge、看到熟悉的提示，以为已经待命，实际什么都没发生。
+   * 「做成了」和「没做成」长得一样，等于没有可观测性。
+   */
+  check('★ 待命成功 → 明确说已连上待命、可以新建会话',
+    /待命/.test(startFn[0]) && /showInformationMessage/.test(startFn[0]));
+  check('★ 待命失败 → 用告警级别、并说明后果（会由对方窗口托管）',
+    /showWarningMessage/.test(startFn[0]) && /没能连上/.test(startFn[0]));
+  check('★ 失败提示里指出去哪看原因', /输出面板|\[follower\]/.test(startFn[0]));
+  check('已在待命的窗口再点一次不会重复连（会提示已在待命）',
+    /if \(follower\)/.test(startFn[0]));
+}
+
+// 主实例消失后要有人接管，否则「主窗口一关，远程能力全没」
+const promoteFn = /async function tryPromoteToMain\([\s\S]*?\n\}/.exec(extSrc);
+check('能定位 tryPromoteToMain', !!promoteFn);
+if (promoteFn) {
+  check('★ 升主走的是 becomeMain 同一条路（不另写一份初始化）',
+    /becomeMain\(/.test(promoteFn[0]));
+  check('★ 升主时不弹二维码（地址和 token 没变，弹了只会打扰另一个窗口的人）',
+    /announce: false/.test(promoteFn[0]));
+  check('★ 抢不到端口就继续当从属，不抛错', /return false/.test(promoteFn[0]));
+  check('升主成功后停掉从属逻辑（否则一个实例同时是主又是从）',
+    /follower\.stop\(\)/.test(promoteFn[0]));
+  check('升主后告诉用户不用重新扫码', /不用重新扫码|没变/.test(promoteFn[0]));
 }
 
 // ---------------------------------------------------------------------------

@@ -661,13 +661,17 @@ async function startFollower(port) {
     onAttach: async (sessionId) => {
       await vscode.commands.executeCommand('kiroAgent.viewSession', sessionId);
     },
+    // 主实例所在的窗口关掉时，端口会释放 —— 这时该有人接管，而不是一直重连一个
+    // 已经不存在的服务。谁抢到端口谁当主，对手机端透明（token 和端口都没变）。
+    tryPromote: () => tryPromoteToMain(port),
   });
   const ok = await follower.start();
   if (!ok) {
     follower = null;
-    return;
+    return false;
   }
   setStatus('$(link) Bridge 待命', '另一个窗口在服务；本窗口已连上待命，可托管本工作区的新会话');
+  return true;
 }
 
 async function attachDesktop(sessionId) {
@@ -1567,15 +1571,17 @@ function releaseAwake() {
   log('[awake] 已释放休眠抑制');
 }
 
-async function start(context) {
-  if (relay) {
-    vscode.window.showInformationMessage('Kiro Bridge 已在运行');
-    return;
-  }
-  const cfg = vscode.workspace.getConfiguration('kiroBridge');
-  const port = cfg.get('port', 3939);
-  const bindLan = cfg.get('bindLan', true);
-
+/**
+ * 成为主实例：抢端口 + 走完整的主实例初始化。
+ *
+ * 抽成独立函数是因为有**两个**入口会走到这里：首次 start()，以及从属实例发现主实例
+ * 没了之后的升主。少了任何一步（keepAwake / mux 连接 / 轮询）都会得到一个"能连上但
+ * 不干活"的半残主实例 —— 而那种状态从手机上看和正常的一模一样，只是列表不更新、
+ * 机器还会睡。所以这条路必须只有一份实现。
+ *
+ * @returns {Promise<boolean>} true = 成为主实例；false = 端口被别人占着（该去当从属）
+ */
+async function becomeMain(context, port, bindLan, { announce = true } = {}) {
   relay = new Relay({
     mediaDir: path.join(context.extensionPath, 'media'),
     log,
@@ -1585,45 +1591,118 @@ async function start(context) {
   try {
     await relay.start(port, bindLan);
   } catch (err) {
-    // 端口被占不等于功能不可用，这里必须把话说清楚。
-    //
-    // 多窗口时只有一个窗口能占到端口，其余窗口点「开启远程会话」都会走到这里。
-    // 而占到端口的那个 relay 会连上**全部**窗口的 mux 端点（MuxPool.refresh() 里
-    // 逐个 endpoint 连），所以所有窗口的会话在手机上都能用 —— 报原始的
-    // EADDRINUSE 会让人以为这个窗口坏了，去查防火墙和端口，方向全错。
     relay = null;
-    if (err && err.code === 'EADDRINUSE') {
-      /*
-       * 端口被占 = 另一个窗口的实例已经在服务。本窗口不再开一个，而是**连回它待命**。
-       *
-       * 待命是有实际用途的，不只是"礼貌地退出"：手机上给本窗口的工作区新建会话时，
-       * 主实例必须让**本窗口**去打开那个会话（vscode 命令跨不了窗口），否则它会被
-       * 主实例所在的窗口接管，agent 就在错误的工作区里干活了。详见 follower.js。
-       *
-       * 连不上就安静放弃，不影响任何现有功能 —— 主实例那边会退回原来的行为并提示用户。
-       */
-      const msg =
-        `端口 ${port} 已被占用，本窗口不再重复开一个服务。` +
-        `通常是另一个 Kiro 窗口的 Bridge 已经在跑 —— 那一个已经覆盖了全部窗口的会话，` +
-        `手机上照常能操作本窗口的会话，不需要在这里再开。` +
-        `如果确认不是（比如被无关程序占用），改 kiroBridge.port 换一个端口。`;
-      log(`[relay] ${msg}`);
-      vscode.window.showInformationMessage(`Kiro Bridge：${msg}`);
-      await startFollower(port);
-      return;
-    }
+    if (err && err.code === 'EADDRINUSE') return false;
     throw err;
   }
   // 远程访问的前提是机器活着；出门在外没人能去点一下鼠标
   keepAwake();
-
   const r = await muxPool.refresh();
   log(`[mux] endpoints=${r.endpointCount} 已连接=${r.connectedCount}`);
-
   startPolling();
   setStatus('$(radio-tower) Bridge on', '远程会话已启动');
-  await showUrl();
-  await collectDiagnostics();
+  if (announce) {
+    await showUrl();
+    await collectDiagnostics();
+  }
+  return true;
+}
+
+/**
+ * 从属实例发现主实例不在了 —— 尝试自己上位。
+ *
+ * 为什么这样就够：端口 listen 天然互斥，所以多个窗口同时尝试是安全的，
+ * 恰好一个成功、其余拿到 EADDRINUSE 后继续当从属。不需要选举协议、不需要锁文件。
+ *
+ * 对手机端是**透明**的：token 存在同一个文件里、端口也没变，所以 URL 不用改、
+ * 不用重新扫码，前端自己重连就恢复了。因此升主时刻意**不弹二维码** ——
+ * 那会在一个用户没在看的窗口里突然弹个面板出来，而且没有任何必要。
+ *
+ * @returns {Promise<boolean>} true = 已升为主实例，调用方应停止从属逻辑
+ */
+async function tryPromoteToMain(port) {
+  if (relay) return true; // 已经是主了（理论上不该走到这）
+  if (!extContext) return false;
+  const cfg = vscode.workspace.getConfiguration('kiroBridge');
+  const bindLan = cfg.get('bindLan', true);
+  let ok = false;
+  try {
+    ok = await becomeMain(extContext, port, bindLan, { announce: false });
+  } catch (err) {
+    log(`[follower] 尝试升为主实例时出错，继续当从属: ${err && err.message}`);
+    return false;
+  }
+  if (!ok) return false;
+  if (follower) {
+    follower.stop();
+    follower = null;
+  }
+  const msg =
+    `原来提供服务的窗口已经不在了，本窗口已接管 —— 手机上的地址和 token 都没变，` +
+    `不用重新扫码（连接会自己恢复）。`;
+  log(`[relay] ★ 已从待命升为主实例。${msg}`);
+  vscode.window.showInformationMessage(`Kiro Bridge：${msg}`);
+  return true;
+}
+
+async function start(context) {
+  if (relay) {
+    vscode.window.showInformationMessage('Kiro Bridge 已在运行');
+    return;
+  }
+  if (follower) {
+    vscode.window.showInformationMessage('Kiro Bridge 已在待命（另一个窗口在提供服务）');
+    return;
+  }
+  const cfg = vscode.workspace.getConfiguration('kiroBridge');
+  const port = cfg.get('port', 3939);
+  const bindLan = cfg.get('bindLan', true);
+
+  let becameMain = false;
+  try {
+    becameMain = await becomeMain(context, port, bindLan);
+  } catch (err) {
+    // 非 EADDRINUSE 的启动失败（权限、地址不可用等）没法兜，如实上抛
+    throw err;
+  }
+  if (becameMain) return;
+
+  /*
+   * 端口被占 = 另一个窗口的实例已经在服务。本窗口不再开一个，而是**连回它待命**。
+   *
+   * 待命有两个实际用途，不只是"礼貌地退出"：
+   *   ① 手机上给本窗口的工作区新建会话时，主实例必须让**本窗口**去打开那个会话
+   *      （vscode 命令跨不了窗口），否则会被主实例所在窗口接管，agent 就在错误的
+   *      工作区里干活。
+   *   ② 主实例所在的窗口关掉之后，待命的窗口会自己接管，远程能力不中断。
+   * 详见 follower.js。
+   */
+  log(`[relay] 端口 ${port} 已被占用，本窗口不开服务，改为连回那个实例待命`);
+  const joined = await startFollower(port);
+  /*
+   * 成功和失败必须给出**不一样的**提示。
+   *
+   * 这里踩过一次：原先无论待命成功还是失败，都只弹一句「端口已被占用」——
+   * 而那句话从更早的版本就存在。于是用户按指引在第二个窗口开了 Bridge、看到熟悉的
+   * 提示，以为已经待命了，实际上什么都没发生（那个窗口跑的还是旧代码）。
+   * 「做成了」和「没做成」长得一样，就等于没有可观测性。
+   */
+  if (joined) {
+    const msg =
+      `端口 ${port} 已被另一个窗口占用，所以本窗口不再开一个服务，` +
+      `而是已经连上它**待命**了 —— 现在可以从手机给本窗口的工作区新建会话，` +
+      `agent 会在这个工作区里干活；那个窗口关掉时本窗口也会自动接管。`;
+    log(`[relay] ★ ${msg}`);
+    vscode.window.showInformationMessage(`Kiro Bridge：${msg}`);
+  } else {
+    const msg =
+      `端口 ${port} 已被占用，而本窗口**没能连上**那个实例。` +
+      `手机上照常能操作本窗口已有的会话；但从手机给本工作区新建的会话会由对方窗口托管，` +
+      `agent 会在对方的工作区里干活。原因见输出面板的 [follower] 日志。` +
+      `如果端口是被无关程序占用的，改 kiroBridge.port 换一个。`;
+    log(`[relay] ★ ${msg}`);
+    vscode.window.showWarningMessage(`Kiro Bridge：${msg}`);
+  }
 }
 
 async function stop() {

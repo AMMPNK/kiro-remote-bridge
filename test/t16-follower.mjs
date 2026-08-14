@@ -12,7 +12,7 @@ import http from 'node:http';
 import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
@@ -180,6 +180,107 @@ const f = new Follower({
   f.stop();
   const gone = await waitFor(() => wss.connections.size === 0, 2000);
   check('stop() 后连接关闭', gone, `剩 ${wss.connections.size} 条`);
+}
+
+// ================================================================ 8. 主实例没了 → 尝试升主
+// 这是「主窗口一关，远程能力全没」的修法。判据是断线后先问一次能不能自己上位，
+// 上位成功就停止从属逻辑（不然一个实例会同时是主又是从）。
+{
+  let promoteAsked = 0;
+  const f2 = new Follower({
+    port: PORT,
+    workspacePaths: ['/ws/promote'],
+    log: () => {},
+    onAttach: async () => {},
+    tryPromote: async () => { promoteAsked += 1; return true; }, // 假装抢到了端口
+  });
+  const ok = await f2.start();
+  check('待命建立', ok === true);
+  const conn = [...wss.connections].pop();
+  conn.terminate(); // 模拟主实例所在的窗口被关掉
+  const asked = await waitFor(() => promoteAsked > 0, 3000);
+  check('★ 主实例断开后会问一次「我能不能自己上位」', asked, `问了 ${promoteAsked} 次`);
+  check('★ 升主成功后停止从属逻辑（stopped=true，不再重连）', f2.stopped === true);
+  const stayed = await waitFor(() => f2.retryTotal > 0, 400);
+  check('★ 升主成功后不再排重连', stayed === false, `重连了 ${f2.retryTotal} 次`);
+  f2.stop();
+}
+
+// ================================================================ 9. 抢不到端口 → 持久重连
+// 原先固定三次就永久放弃，而失效是静默的、要到人真正去用时才暴露。
+// 现在退避到最后一档会一直重试。这里只验「不会因为次数用完而停」。
+{
+  let promoteTries = 0;
+  const f3 = new Follower({
+    port: PORT,
+    workspacePaths: ['/ws/keepretry'],
+    log: () => {},
+    onAttach: async () => {},
+    tryPromote: async () => { promoteTries += 1; return false; }, // 一直抢不到
+  });
+  const ok = await f3.start();
+  check('待命建立', ok === true);
+  // 把退避第一档压到很小，否则要等 1 秒起
+  const conn = [...wss.connections].pop();
+  conn.terminate();
+  // 连续断几次，确认它一直在重连而不是放弃
+  const reconnected = await waitFor(() => f3.retryTotal >= 1, 3000);
+  check('★ 断开后会重连（不是立刻放弃）', reconnected, `retryTotal=${f3.retryTotal}`);
+  check('★ 每次断开都先问过能不能升主', promoteTries >= 1, `问了 ${promoteTries} 次`);
+  const reconnectedAgain = await waitFor(() => wss.connections.size > 0, 3000);
+  check('★ 真的连回来了', reconnectedAgain, `连接数 ${wss.connections.size}`);
+  // 再断一次，验证退避没有"用完次数就不干了"
+  const before = f3.retryTotal;
+  const conn2 = [...wss.connections].pop();
+  if (conn2) conn2.terminate();
+  const again = await waitFor(() => f3.retryTotal > before, 4000);
+  check('★ 第二次断开照样重连（不存在"次数用完"）', again,
+    `retryTotal ${before} → ${f3.retryTotal}`);
+
+  /*
+   * 上面只走到第 2 次重连。真正要守的是「**退到最后一档之后一直重试、永不放弃**」，
+   * 而端到端验它要连断 5 次、累计等 1+3+8+20+60 秒，测试会慢到没人愿意跑。
+   * 所以这里改成检查那段索引逻辑本身：用 Math.min 夹住索引就意味着不会越界成
+   * undefined、也就不会出现"次数用完"。注入验证过：把它换回
+   * `RETRY_DELAYS_MS[this.retry]` + `if (undefined) return`，前面那两条断言仍然通过
+   * （因为 3 次以内够用），只有这条能拦住。
+   */
+  const followerSrc = readFileSync(join(ROOT, 'src', 'follower.js'), 'utf8');
+  check('★ 退避索引被夹住，不会因为次数用完而放弃',
+    /Math\.min\(this\.retry, RETRY_DELAYS_MS\.length - 1\)/.test(followerSrc));
+  check('退避序列是单调递增的，且最长一档到分钟级', (() => {
+    const m = /const RETRY_DELAYS_MS = \[([^\]]+)\]/.exec(followerSrc);
+    if (!m) return false;
+    const arr = m[1].split(',').map((x) => Number(x.trim()));
+    const inc = arr.every((v, i) => i === 0 || v > arr[i - 1]);
+    return inc && arr[arr.length - 1] >= 30000;
+  })(), (/const RETRY_DELAYS_MS = \[([^\]]+)\]/.exec(followerSrc) || [, '?'])[1].trim());
+  /*
+   * stop() 之后不能再连回来 —— 少了 stop 里清理定时器那一步就会。
+   *
+   * 断言要挑对时机：必须在**有一个重连已经排上、但还没触发**的那一刻调 stop，
+   * 否则「stop 后连接数没涨」是恒真的（本来就没有待触发的重连）。
+   * 第一版就写错了，跑出来是「stop 前 0 → 现在 0」，看着通过、其实什么都没测。
+   */
+  const c3 = [...wss.connections].pop();
+  if (c3) c3.terminate();
+  await waitFor(() => f3._retryTimer !== null && !f3.connected, 2000);
+  check('确认此刻有一个重连正排着（下面那条断言才有意义）',
+    !!f3._retryTimer && !f3.connected, `timer=${!!f3._retryTimer} connected=${f3.connected}`);
+  f3.stop();
+  const cnt = wss.connections.size;
+  await new Promise((r) => setTimeout(r, 1500));
+  check('★ stop() 之后那个排上的重连不会再执行',
+    wss.connections.size === cnt && f3.connected === false,
+    `stop 前 ${cnt} → 现在 ${wss.connections.size}，connected=${f3.connected}`);
+  /*
+   * 关于上面这条的守护层次（注入实测过，如实记下来）：
+   * 这个行为实际由 `stopped` 标志保证 —— 定时器回调开头就是 `if (this.stopped) return`。
+   * 把 stop() 里的 clearTimeout 删掉，这条断言**照样通过**，因为标志已经挡住了重连。
+   * 所以 clearTimeout 是资源清理（不留一个必然空转的定时器），不是这条行为的守护者。
+   * 保留断言是对的（它验的是行为），但别指望它能守住 clearTimeout ——
+   * 那属于「这个分支不该由这一层守护」。
+   */
 }
 
 wss.closeAll();
