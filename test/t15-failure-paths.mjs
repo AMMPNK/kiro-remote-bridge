@@ -322,6 +322,51 @@ const T = ext.__test;
 // 且 HOME 已隔离到沙箱，所以这里调它是安全的。
 ext.activate({ subscriptions: [], extensionPath: ROOT });
 
+// ---------------------------------------------------------------------------
+// 扩展文件已被新版本删掉的窗口，不许开服务也不许升主
+// ---------------------------------------------------------------------------
+// 实测故障：`context.extensionPath` 是窗口启动那一刻的路径快照，而安装新版本会把旧版本
+// 目录整个删掉。于是一个装过新版却没重载的窗口，代码还在内存里跑，**资源目录已经没了**。
+// 升主机制上线后，这种窗口在原主实例退出时接管了服务：relay 正常监听、升主提示还写着
+// 「已接管，不用重新扫码」，而 relay 每次请求都去 mediaDir 读盘 —— 全部 404。
+// 看起来一切正常，实际是个空壳服务，而用户会误判成"地址过期了"（实测就是这么误判的）。
+{
+  check('★ 有 mediaDirUsable 这道前置检查', typeof T.mediaDirUsable === 'function');
+  if (typeof T.mediaDirUsable === 'function') {
+    check('资源目录在 → 判定可用', T.mediaDirUsable({ extensionPath: ROOT }) === true);
+    check('★ 资源目录不在 → 判定不可用',
+      T.mediaDirUsable({ extensionPath: join(SANDBOX, 'gone-0.8.1') }) === false);
+    check('extensionPath 是空值也不炸',
+      T.mediaDirUsable({}) === false && T.mediaDirUsable({ extensionPath: '' }) === false);
+  }
+  // becomeMain 必须在**开端口之前**就挡住，否则会真的开出一个 404 服务
+  const mainSrc = /async function becomeMain\([\s\S]*?\n\}/.exec(extSrc);
+  if (mainSrc) {
+    const idxCheck = mainSrc[0].indexOf('mediaDirUsable');
+    const idxListen = mainSrc[0].indexOf('relay.start(');
+    check('★ 检查发生在 relay.start() 之前（不能先开端口再发现资源没了）',
+      idxCheck >= 0 && idxListen >= 0 && idxCheck < idxListen,
+      `check@${idxCheck} listen@${idxListen}`);
+    check('用专门的错误码标记这种失败（调用方要据此分流）',
+      /EXT_FILES_GONE/.test(mainSrc[0]));
+    // 提示必须指向一个可执行的动作，否则用户只知道"坏了"不知道"怎么办"
+    check('★ 报错文案里指出了具体动作（重载本窗口）', /重载本窗口/.test(mainSrc[0]));
+  }
+  // 两个调用方都要处理：升主时放弃并告警，手动启动时告诉用户去重载
+  const promoteSrc = /async function tryPromoteToMain\([\s\S]*?\n\}/.exec(extSrc);
+  if (promoteSrc) {
+    check('★ 升主时遇到这种情况会放弃（让重载过的窗口去接管）',
+      /EXT_FILES_GONE/.test(promoteSrc[0]) && /return false/.test(promoteSrc[0]));
+    check('★ 并且给告警而不是只写日志（否则用户只会看到"连不上"）',
+      /showWarningMessage/.test(promoteSrc[0]));
+  }
+  const startSrc2 = /async function start\(context\) \{[\s\S]*?\n\}/.exec(extSrc);
+  if (startSrc2) {
+    check('手动启动时也挡住，并提示重载',
+      /EXT_FILES_GONE/.test(startSrc2[0]) && /showWarningMessage/.test(startSrc2[0]));
+  }
+}
+
 check('__test 暴露了这条决策链需要的东西',
   typeof T.sendToSession === 'function' &&
   typeof T.isDefinitelyNotDelivered === 'function' &&

@@ -1636,7 +1636,48 @@ function releaseAwake() {
  *
  * @returns {Promise<boolean>} true = 成为主实例；false = 端口被别人占着（该去当从属）
  */
+/**
+ * 本窗口加载的扩展文件还在磁盘上吗？
+ *
+ * `context.extensionPath` 是**窗口启动那一刻**的路径快照，而安装新版本会把旧版本目录
+ * 整个删掉（同一个扩展 id 只留一个目录，否则 Kiro 加载哪个版本靠猜）。于是一个装过新版
+ * 却没重载的窗口，代码还在内存里跑得好好的，**但它的资源目录已经不存在了**。
+ *
+ * 实测故障（这条检查的由来）：升主机制上线后，一个没重载的窗口在原主实例退出时接管了
+ * 服务。relay 正常监听、升主提示还写着「已接管，不用重新扫码」，而 relay 每次请求都要
+ * 去 `mediaDir` 读盘 —— 那个目录已经被删了，于是手机上每个页面都是 404。
+ * **看起来一切正常，实际提供的是一个空壳服务。**
+ *
+ * 升主之前必须挡住这种窗口：它没资格当主。挡住之后其余窗口（重载过的那些）还有机会
+ * 接管；如果一个都没有，那也该明确告警，而不是让人对着 404 猜是不是地址过期了。
+ */
+function mediaDirUsable(context) {
+  try {
+    const base = context && context.extensionPath;
+    /*
+     * 必须先确认 base 是个非空的绝对路径。
+     *
+     * `path.join('', 'media', 'app.html')` 得到的是**相对路径** `media/app.html`，
+     * 于是 existsSync 会按当前工作目录去解析 —— 在项目根目录下跑的时候那个文件恰好存在，
+     * 结果把"压根没有 extensionPath"判成了"资源可用"。测试里注入空值时抓到的。
+     */
+    if (typeof base !== 'string' || !base || !path.isAbsolute(base)) return false;
+    return fs.existsSync(path.join(base, 'media', 'app.html'));
+  } catch (_) {
+    return false;
+  }
+}
+
 async function becomeMain(context, port, bindLan, { announce = true } = {}) {
+  // 资源目录没了就别开服务 —— 开出来只会是个每个请求都 404 的空壳
+  if (!mediaDirUsable(context)) {
+    const err = new Error(
+      '本窗口加载的扩展文件已经不在磁盘上了（通常是装了新版本但这个窗口还没重载）。' +
+        '这种状态下开出来的服务每个请求都会 404，所以拒绝启动。请重载本窗口。'
+    );
+    err.code = 'EXT_FILES_GONE';
+    throw err;
+  }
   relay = new Relay({
     mediaDir: path.join(context.extensionPath, 'media'),
     log,
@@ -1684,6 +1725,19 @@ async function tryPromoteToMain(port) {
   try {
     ok = await becomeMain(extContext, port, bindLan, { announce: false });
   } catch (err) {
+    if (err && err.code === 'EXT_FILES_GONE') {
+      /*
+       * 本窗口的扩展文件已被新版本替换掉了，接管出来只会是个每个请求都 404 的空壳。
+       * 所以放弃升主，让别的（重载过的）窗口去抢。
+       *
+       * 这里要给**告警**而不是只写日志：如果所有窗口都处于这个状态，那就没人能接管，
+       * 而用户看到的现象是"手机连不上"，很容易误判成地址过期或者网络问题 ——
+       * 实测就是这么误判的。必须有一条明确指向"重载窗口"的提示。
+       */
+      log(`[follower] ★ 放弃升主：${err.message}`);
+      vscode.window.showWarningMessage(`Kiro Bridge：${err.message}`);
+      return false;
+    }
     log(`[follower] 尝试升为主实例时出错，继续当从属: ${err && err.message}`);
     return false;
   }
@@ -1717,6 +1771,13 @@ async function start(context) {
   try {
     becameMain = await becomeMain(context, port, bindLan);
   } catch (err) {
+    if (err && err.code === 'EXT_FILES_GONE') {
+      // 用户手动点「开启远程会话」而本窗口的扩展文件已被新版本替换 ——
+      // 直接告诉他要重载，而不是抛一个看不懂的堆栈
+      log(`[relay] ★ 拒绝启动：${err.message}`);
+      vscode.window.showWarningMessage(`Kiro Bridge：${err.message}`);
+      return;
+    }
     // 非 EADDRINUSE 的启动失败（权限、地址不可用等）没法兜，如实上抛
     throw err;
   }
@@ -1930,6 +1991,7 @@ module.exports = {
     // 「attach 派给哪个窗口」这个决策必须真跑：它的失败方向（派不出去时没有退回本地
     // attach）会让审批悄悄失效，而那比不做这个功能更糟，静态检查看不出来。
     attachInOwningWindow,
+    mediaDirUsable,
     setRelayForTest: (r) => { relay = r; },
     resolveFollowerForTest: (reqId, payload) => {
       const w = followerWaiters.get(String(reqId));
