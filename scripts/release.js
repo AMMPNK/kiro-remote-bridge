@@ -196,6 +196,9 @@ const REQUIRED = [
   'src/sessionStore.js',
   'src/wsServer.js',
   'src/muxClient.js',
+  // 少了它，跨窗口新建会话会静默退回「本窗口接管」——agent 在错误的工作区里干活，
+  // 而扩展照样能装、能跑，没有任何报错。这正是白名单漏项那类静默故障。
+  'src/follower.js',
 ];
 const missing = REQUIRED.filter((f) => !fs.existsSync(path.join(installed, f)));
 if (missing.length) {

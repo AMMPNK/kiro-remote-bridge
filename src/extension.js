@@ -18,6 +18,7 @@ const { spawn } = require('child_process');
 const { SessionStore } = require('./sessionStore');
 const { MuxPool } = require('./muxClient');
 const { Relay } = require('./relay');
+const { Follower } = require('./follower');
 const { parseConfigOptions } = require('./presets');
 
 /**
@@ -156,6 +157,28 @@ function buildHandlers() {
       });
       conn.sendJson({ type: 'sessions', items: store.listSessions() });
       conn.sendJson({ type: 'status', ...store.aggregateStatus(), mux: muxSummary() });
+    },
+
+    /*
+     * 另一个窗口的扩展实例报到。它没抢到端口，所以连回来待命 ——
+     * 主实例需要「在某个窗口打开会话」时会把活派给它（见 attachInOwningWindow）。
+     *
+     * 只在连接上打个标记，不做别的。标记跟着连接走，断开自动失效，
+     * 不需要额外的清理逻辑（与 conn.watchedSessionId 同一个套路）。
+     */
+    'follower:hello': async (msg, conn) => {
+      const paths = Array.isArray(msg.workspacePaths) ? msg.workspacePaths.map(String) : [];
+      if (conn) conn.followerWorkspaces = paths;
+      log(`[follower] 窗口报到，workspace=${paths.join(', ') || '(无)'}`);
+      return { type: 'follower:welcome' };
+    },
+
+    /** 派出去的活回来了。用 reqId 对上号，唤醒 attachInOwningWindow 里等着的那个 promise */
+    'follower:attached': async (msg) => {
+      const waiter = msg && msg.reqId ? followerWaiters.get(String(msg.reqId)) : null;
+      if (waiter) waiter(msg);
+      // 不回响应：这本身就是对我们下发指令的回复，再回一条会让从属侧收到不认识的消息
+      return undefined;
     },
 
 
@@ -562,41 +585,22 @@ async function createSession(workspacePath, picks) {
     }
   }
   /*
-   * 跨窗口创建的会话，实际会在**本窗口**的工作区里干活 —— 这件事必须告诉用户。
+   * notes 收「已经建成功了，但有件事你必须知道」。
    *
-   * 原因链：`session/new` 是发给目标窗口的连接的，所以会话确实建在目标 workspace 下；
-   * 但紧接着的 attachDesktop 走 `vscode.commands.executeCommand`，**只能在本窗口执行**
-   * （扩展宿主一个窗口一个进程，命令不能跨窗口）。被它打开之后,本窗口就接管了这个会话,
-   * 连 agent 看到的工作区上下文一起接管。
+   * 目前只有一条：跨窗口创建时派活失败，会话被本窗口接管，于是 agent 在**错误的
+   * 工作区**里干活。这不是显示问题 —— 它会读写错目录里的文件。
    *
-   * 实测证据(不是推断):手机上选 Kiro 工作区建的会话,磁盘上在两个 workspace 目录下
-   * 各有一份 session.json —— 目标窗口那份带着正确的模型、却没有任何消息;
-   * 本窗口那份有 175KB 消息,而消息里出现的路径**全是本窗口工作区下的**,
-   * 一条目标工作区的路径都没有。也就是说 agent 在错误的目录里干活。
+   * 背景（改动的由来）：`vscode.commands.executeCommand` 只在本窗口生效，所以早先
+   * 无论目标是哪个窗口，attach 都发生在本窗口，本窗口就此接管会话与工作区上下文。
+   * 实测证据：手机上选 Kiro 工作区建的会话，磁盘上两个 workspace 目录各有一份
+   * session.json —— 目标窗口那份带着正确的模型却没有任何消息，本窗口那份有 175KB
+   * 消息，而消息里的路径全是本窗口工作区下的。
    *
-   * 为什么不干脆不 attachDesktop:那样这个会话的审批会在 6~20ms 内被判 cancelled
-   * （见下面那段注释的依据），手机上根本批不动,任务也做不下去。两害相权,
-   * 现在的选择是**保留 attach、但把真实归属说清楚**,而不是静默地跑错目录。
-   *
-   * 根治要让「拥有会话的那个窗口」自己去 attach,而 vscode 命令跨不了窗口,
-   * 需要新增一条窗口间通道（非主窗口的扩展实例以从属模式连上主实例）。
-   * 那是个独立的改动,记在 BACKLOG 里。
+   * 现在由 attachInOwningWindow 把 attach 派给目标窗口的从属实例，正常情况下归属正确、
+   * 不产生 notes。只有派不出去（那个窗口没有待命实例／超时）才退回本窗口接管，
+   * 那时才需要提示 —— 见下面 attachInOwningWindow 的返回值判断。
    */
-  const localFolders = (vscode.workspace.workspaceFolders || []).map((f) => f.uri.fsPath);
-  const samePath = (a, b) => path.resolve(String(a)) === path.resolve(String(b));
-  const targetIsLocal = !workspacePath || localFolders.some((p) => samePath(p, workspacePath));
   const notes = [];
-  if (!targetIsLocal) {
-    const localName = localFolders.length ? path.basename(localFolders[0]) : '(无工作区)';
-    const wantName = path.basename(String(workspacePath));
-    const warn =
-      `会话建在「${wantName}」，但远程审批要求由本窗口托管它，` +
-      `所以 agent 实际是在「${localName}」这个工作区里干活。` +
-      `要真在「${wantName}」里改东西，得在电脑上把 Bridge 切到那个窗口再建会话。`;
-    log(`[create] ★ 跨窗口创建 target=${workspacePath} 本窗口=${localFolders.join(',')}`);
-    log(`[create] ★ ${warn}`);
-    notes.push(warn);
-  }
 
   // 让桌面端 attach 到这个会话，否则它的审批请求会被立刻取消。
   // 依据：ACP SDK 的 requestPermission 是「按 sessionId 找 handler，找不到就直接返回
@@ -604,9 +608,29 @@ async function createSession(workspacePath, picks) {
   // 拥有该会话的桌面面板通过 onPermissionRequest(sessionId, …) 注册。纯靠 mux 创建的
   // 会话没有面板拥有它 → 无 handler → 实测 6~20ms 内就被判 cancelled，手机上批不动。
   // Kiro 自己的程序化建会话流程也是先 viewSession 再发 prompt，这里沿用同一做法。
-  await attachDesktop(sessionId);
+  /*
+   * 在**拥有这个会话的那个窗口**里打开它。
+   *
+   * 目标工作区属于本窗口时就是原来的行为；不属于时把活派给那个窗口的从属实例，
+   * 这样 agent 的工作区上下文才是用户选的那个。派不出去（那个窗口没有待命实例、
+   * 或者超时）会退回本地 attach —— 功能不受影响，但会话归属回到老样子，
+   * 那时才需要提示用户。
+   */
+  const attached = await attachInOwningWindow(sessionId, cwd);
+  if (!attached.ownedByLocal && attached.via === 'local') {
+    const localFolders = (vscode.workspace.workspaceFolders || []).map((f) => f.uri.fsPath);
+    const localName = localFolders.length ? path.basename(localFolders[0]) : '(无工作区)';
+    const wantName = path.basename(String(cwd));
+    const warn =
+      `会话建在「${wantName}」，但那个窗口没有待命的 Bridge 实例，` +
+      `只能由本窗口托管它 —— 所以 agent 实际是在「${localName}」这个工作区里干活。` +
+      `要真在「${wantName}」里改东西，在那个窗口里也开一次远程会话（或重载它）再试。`;
+    log(`[create] ★ 跨窗口但派不出去 target=${cwd} 本窗口=${localFolders.join(',')}`);
+    log(`[create] ★ ${warn}`);
+    notes.push(warn);
+  }
 
-  return { sessionId, cwd, applied, failed, notes };
+  return { sessionId, cwd, applied, failed, notes, attachedVia: attached.via };
 }
 
 /**
@@ -616,6 +640,36 @@ async function createSession(workspacePath, picks) {
  * 审批都会被静默取消。只在「手机新建会话」时调用，不在打开已有会话时调用：
  * 那会把你在电脑上正在用的会话挤掉，反而弄坏本来正常的审批。
  */
+/** 本窗口作为从属实例连回主实例后的句柄；null 表示没在待命 */
+let follower = null;
+
+/**
+ * 让本窗口进入从属模式，连回已经占住端口的那个实例待命。
+ *
+ * 唯一的用途：主实例需要「在本窗口打开某个会话」时派活给我们。
+ * 失败不抛错、不重试到底 —— 这条通道是锦上添花，它不通只是让会话归属回到老样子。
+ */
+async function startFollower(port) {
+  if (follower) return;
+  const workspacePaths = (vscode.workspace.workspaceFolders || []).map((f) => f.uri.fsPath);
+  follower = new Follower({
+    port,
+    workspacePaths,
+    log,
+    // 派来的活就是在本窗口执行一次 viewSession —— 这行代码跑在本窗口的扩展宿主里，
+    // 所以它作用于本窗口，而本窗口正是那个会话真正归属的地方。
+    onAttach: async (sessionId) => {
+      await vscode.commands.executeCommand('kiroAgent.viewSession', sessionId);
+    },
+  });
+  const ok = await follower.start();
+  if (!ok) {
+    follower = null;
+    return;
+  }
+  setStatus('$(link) Bridge 待命', '另一个窗口在服务；本窗口已连上待命，可托管本工作区的新会话');
+}
+
 async function attachDesktop(sessionId) {
   try {
     await vscode.commands.executeCommand('kiroAgent.viewSession', sessionId);
@@ -623,6 +677,80 @@ async function attachDesktop(sessionId) {
   } catch (err) {
     log(`[attach] 打开失败，该会话的审批可能会被直接取消: ${err && err.message}`);
   }
+}
+
+/** 派给从属窗口的活，等它回话时用 reqId 找回这里 */
+const followerWaiters = new Map();
+let followerReqSeq = 0;
+/**
+ * 派活的等待上限。从属那边只是执行一次 viewSession，正常在几十毫秒内回话。
+ * 用 let 只是为了让测试把它调小（测超时分支不该真等 4 秒），生产路径里不变。
+ */
+let FOLLOWER_ATTACH_TIMEOUT_MS = 4000;
+
+/**
+ * 在「真正拥有这个会话的那个窗口」里打开它。
+ *
+ * 为什么不能直接用 attachDesktop：`vscode.commands.executeCommand` 只在**本窗口**生效
+ * （扩展宿主一个窗口一个进程），所以本窗口一 attach，本窗口就接管了这个会话 ——
+ * 连 agent 看到的工作区上下文一起接管。实测表现是「选了 A 工作区，agent 在 B 里干活」。
+ *
+ * 所以目标工作区不属于本窗口时，把活派给那个窗口的从属实例去做。派不出去就退回本地
+ * attach —— **最坏情况不比改之前差**，这一点是刻意的：这条通道属于锦上添花，
+ * 它失效不该让「新建会话」这个基本功能坏掉，只是会话归属回到老样子（并照旧提示）。
+ *
+ * @returns {Promise<{via:'local'|'follower', ownedByLocal:boolean}>}
+ *   via = follower 表示已在正确的窗口打开；local 表示退回了本地 attach
+ */
+async function attachInOwningWindow(sessionId, workspacePath) {
+  const localFolders = (vscode.workspace.workspaceFolders || []).map((f) => f.uri.fsPath);
+  const same = (a, b) => path.resolve(String(a)) === path.resolve(String(b));
+  const ownedByLocal = !workspacePath || localFolders.some((p) => same(p, workspacePath));
+
+  if (ownedByLocal) {
+    await attachDesktop(sessionId);
+    return { via: 'local', ownedByLocal: true };
+  }
+
+  // 找报到过、且负责这个 workspace 的那条从属连接
+  const match = (c) =>
+    Array.isArray(c.followerWorkspaces) && c.followerWorkspaces.some((p) => same(p, workspacePath));
+  const reqId = `fa${++followerReqSeq}`;
+  let sent = 0;
+  if (relay) {
+    sent = relay.broadcastTo(match, { type: 'follower:attach', sessionId, reqId });
+  }
+  if (!sent) {
+    log(
+      `[attach] 目标窗口（${workspacePath}）没有待命的实例，退回本地 attach —— ` +
+        '该会话会由本窗口接管'
+    );
+    await attachDesktop(sessionId);
+    return { via: 'local', ownedByLocal: false };
+  }
+
+  const reply = await new Promise((resolve) => {
+    const timer = setTimeout(() => {
+      followerWaiters.delete(reqId);
+      resolve(null);
+    }, FOLLOWER_ATTACH_TIMEOUT_MS);
+    followerWaiters.set(reqId, (m) => {
+      clearTimeout(timer);
+      followerWaiters.delete(reqId);
+      resolve(m);
+    });
+  });
+
+  if (reply && reply.ok) {
+    log(`[attach] ★ 已由目标窗口自己打开 ${sessionId}（workspace=${workspacePath}）`);
+    return { via: 'follower', ownedByLocal: false };
+  }
+  log(
+    `[attach] 目标窗口没能打开（${(reply && reply.error) || '超时'}），退回本地 attach —— ` +
+      '该会话会由本窗口接管'
+  );
+  await attachDesktop(sessionId);
+  return { via: 'local', ownedByLocal: false };
 }
 
 function currentWorkspaceName() {
@@ -1465,6 +1593,15 @@ async function start(context) {
     // EADDRINUSE 会让人以为这个窗口坏了，去查防火墙和端口，方向全错。
     relay = null;
     if (err && err.code === 'EADDRINUSE') {
+      /*
+       * 端口被占 = 另一个窗口的实例已经在服务。本窗口不再开一个，而是**连回它待命**。
+       *
+       * 待命是有实际用途的，不只是"礼貌地退出"：手机上给本窗口的工作区新建会话时，
+       * 主实例必须让**本窗口**去打开那个会话（vscode 命令跨不了窗口），否则它会被
+       * 主实例所在的窗口接管，agent 就在错误的工作区里干活了。详见 follower.js。
+       *
+       * 连不上就安静放弃，不影响任何现有功能 —— 主实例那边会退回原来的行为并提示用户。
+       */
       const msg =
         `端口 ${port} 已被占用，本窗口不再重复开一个服务。` +
         `通常是另一个 Kiro 窗口的 Bridge 已经在跑 —— 那一个已经覆盖了全部窗口的会话，` +
@@ -1472,6 +1609,7 @@ async function start(context) {
         `如果确认不是（比如被无关程序占用），改 kiroBridge.port 换一个端口。`;
       log(`[relay] ${msg}`);
       vscode.window.showInformationMessage(`Kiro Bridge：${msg}`);
+      await startFollower(port);
       return;
     }
     throw err;
@@ -1491,10 +1629,17 @@ async function start(context) {
 async function stop() {
   stopPolling();
   releaseAwake();
+  // 本窗口可能是从属身份（连回别人待命），也要断开 —— 否则「已停止」之后
+  // 主实例还会往这儿派活，而用户以为这个窗口已经完全退出了
+  if (follower) {
+    follower.stop();
+    follower = null;
+  }
   if (relay) {
     relay.stop();
     relay = null;
   }
+  followerWaiters.clear();
   muxPool.dispose();
   pendingPermissions.clear();
   subscribedTo.clear();
@@ -1648,6 +1793,17 @@ module.exports = {
     // 下面这几个一起暴露，测试才能替换掉 muxPool、喂各种失败进去看它选哪条路。
     sendToSession,
     createSession,
+    // 「attach 派给哪个窗口」这个决策必须真跑：它的失败方向（派不出去时没有退回本地
+    // attach）会让审批悄悄失效，而那比不做这个功能更糟，静态检查看不出来。
+    attachInOwningWindow,
+    setRelayForTest: (r) => { relay = r; },
+    resolveFollowerForTest: (reqId, payload) => {
+      const w = followerWaiters.get(String(reqId));
+      if (w) w({ reqId, ...payload });
+      return !!w;
+    },
+    followerWaiterCount: () => followerWaiters.size,
+    setFollowerTimeoutForTest: (ms) => { FOLLOWER_ATTACH_TIMEOUT_MS = ms; },
     isDefinitelyNotDelivered,
     isPromptInFlight,
     isSessionUnknown,

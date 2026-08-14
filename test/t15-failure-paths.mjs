@@ -506,11 +506,131 @@ check('带附件时一律不走降级通道（纯文本通道会悄悄丢掉附�
   check('尾斜杠不算跨窗口', !(trailing.notes && trailing.notes.length),
     JSON.stringify(trailing.notes || []));
 
-  // 没指定工作区时按连接的默认走，也不该报跨窗口
+  /*
+   * 没显式选工作区时，判据是「agent 实际会落在哪」（连接解析出来的 cwd），
+   * 而不是「用户有没有点选」。连接默认落在别的窗口时照样要提示 ——
+   * 用户没点选并不代表他愿意让 agent 在另一个工作区里改文件。
+   */
   localWsFolders = [{ uri: { fsPath: '/ws/personal' } }];
   const noWs = await T.createSession(undefined, {});
-  check('没指定工作区 → 不报跨窗口', !(noWs.notes && noWs.notes.length),
-    JSON.stringify(noWs.notes || []));
+  check('★ 没显式选工作区、但解析出的 cwd 属于别的窗口 → 照样提示',
+    !!(noWs.notes && noWs.notes.length), JSON.stringify(noWs.notes || []));
+
+  // 连接压根没有工作区信息 → 无从判断跨没跨，不提示（不能凭空报警）
+  const nakedConn = {
+    endpoint: { port: 5556, folders: [] },
+    newSession: async () => ({ sessionId: 'sess_new_naked', configOptions: [] }),
+    setConfigOption: async () => ({ configOptions: [] }),
+  };
+  T.setMuxPoolForTest({ pickForWorkspace: () => nakedConn });
+  const naked = await T.createSession(undefined, {});
+  check('连接没有工作区信息 → 不提示', !(naked.notes && naked.notes.length),
+    JSON.stringify(naked.notes || []));
+  T.setMuxPoolForTest({ pickForWorkspace: () => fakeConn });
+}
+
+// ---------------------------------------------------------------------------
+// ⑥ 把 attach 派给拥有会话的那个窗口
+// ---------------------------------------------------------------------------
+// vscode 命令跨不了窗口，所以主实例只能让**目标窗口自己**去打开会话。
+// 这一组测的是路由决策，重点在**失败方向**：派不出去时必须退回本地 attach 并提示，
+// 而不是静默地不 attach —— 那会让审批悄悄失效，比不做这个功能更糟。
+{
+  const T2 = ext.__test;
+  check('__test 暴露了 attachInOwningWindow', typeof T2.attachInOwningWindow === 'function');
+
+  if (typeof T2.attachInOwningWindow === 'function') {
+    // 假 relay：只实现 broadcastTo，按谓词挑“从属连接”并记下发出去的指令
+    const makeRelay = (followers) => ({
+      broadcastTo: (pred, obj) => {
+        let n = 0;
+        for (const c of followers) {
+          let want = false;
+          try { want = !!pred(c); } catch (_) { want = false; }
+          if (want) { c.got.push(obj); n += 1; }
+        }
+        return n;
+      },
+    });
+
+    // A. 目标就是本窗口 → 本地 attach，压根不派活
+    localWsFolders = [{ uri: { fsPath: '/ws/kiro' } }];
+    const f0 = [{ followerWorkspaces: ['/ws/other'], got: [] }];
+    T2.setRelayForTest(makeRelay(f0));
+    executed.length = 0;
+    const rLocal = await T2.attachInOwningWindow('s1', '/ws/kiro');
+    check('目标是本窗口 → 本地 attach',
+      rLocal.via === 'local' && rLocal.ownedByLocal === true);
+    check('目标是本窗口 → 不往外派活', f0[0].got.length === 0);
+    check('目标是本窗口 → 真的调了 viewSession',
+      executed.some((e) => e.cmd === 'kiroAgent.viewSession'));
+
+    // B. 目标是别的窗口且那边有待命实例 → 派出去，且**不做**本地 attach
+    localWsFolders = [{ uri: { fsPath: '/ws/personal' } }];
+    const fOk = [{ followerWorkspaces: ['/ws/kiro'], got: [] }];
+    T2.setRelayForTest(makeRelay(fOk));
+    executed.length = 0;
+    const pOk = T2.attachInOwningWindow('s2', '/ws/kiro');
+    // 等指令发出，再模拟那个窗口回话
+    for (let i = 0; i < 50 && !fOk[0].got.length; i++) await new Promise((r) => setTimeout(r, 5));
+    check('★ 跨窗口 → 把 attach 指令派给负责那个 workspace 的窗口',
+      fOk[0].got.length === 1 && fOk[0].got[0].type === 'follower:attach' &&
+        fOk[0].got[0].sessionId === 's2',
+      JSON.stringify(fOk[0].got[0] || {}));
+    T2.resolveFollowerForTest(fOk[0].got[0].reqId, { ok: true });
+    const rOk = await pOk;
+    check('★ 目标窗口回报成功 → via=follower', rOk.via === 'follower', `via=${rOk.via}`);
+    check('★ 派成功后不再本地 attach（否则本窗口又把会话抢回来了）',
+      !executed.some((e) => e.cmd === 'kiroAgent.viewSession'),
+      executed.map((e) => e.cmd).join(',') || '(没调)');
+
+    // C. 没有任何窗口负责这个 workspace → 退回本地 attach
+    const fNone = [{ followerWorkspaces: ['/ws/unrelated'], got: [] }];
+    T2.setRelayForTest(makeRelay(fNone));
+    executed.length = 0;
+    const rNone = await T2.attachInOwningWindow('s3', '/ws/kiro');
+    check('★ 没有待命窗口 → 退回本地 attach（功能不能因此坏掉）',
+      rNone.via === 'local' && rNone.ownedByLocal === false);
+    check('★ 退回时确实执行了本地 attach',
+      executed.some((e) => e.cmd === 'kiroAgent.viewSession'));
+
+    // D. 派出去了但对方报失败 → 同样退回本地
+    const fBad = [{ followerWorkspaces: ['/ws/kiro'], got: [] }];
+    T2.setRelayForTest(makeRelay(fBad));
+    executed.length = 0;
+    const pBad = T2.attachInOwningWindow('s4', '/ws/kiro');
+    for (let i = 0; i < 50 && !fBad[0].got.length; i++) await new Promise((r) => setTimeout(r, 5));
+    T2.resolveFollowerForTest(fBad[0].got[0].reqId, { ok: false, error: 'viewSession 抛了' });
+    const rBad = await pBad;
+    check('★ 目标窗口报失败 → 退回本地 attach', rBad.via === 'local');
+    check('★ 报失败时也执行了本地 attach，审批不会悄悄失效',
+      executed.some((e) => e.cmd === 'kiroAgent.viewSession'));
+
+    // E. 对方不回话（超时）→ 退回本地。把超时调小，不然要等 4 秒
+    const fMute = [{ followerWorkspaces: ['/ws/kiro'], got: [] }];
+    T2.setRelayForTest(makeRelay(fMute));
+    T2.setFollowerTimeoutForTest(80);
+    executed.length = 0;
+    const rMute = await T2.attachInOwningWindow('s5', '/ws/kiro');
+    check('★ 目标窗口不回话 → 超时后退回本地 attach', rMute.via === 'local');
+    check('★ 超时退回时也执行了本地 attach',
+      executed.some((e) => e.cmd === 'kiroAgent.viewSession'));
+    check('超时后不留悬挂的等待记录（否则每次派活都渗一条，越跑越多）',
+      T2.followerWaiterCount() === 0, `残留 ${T2.followerWaiterCount()} 条`);
+
+    // 路径写法差异不该让匹配失败
+    const fSlash = [{ followerWorkspaces: ['/ws/kiro/'], got: [] }];
+    T2.setRelayForTest(makeRelay(fSlash));
+    const pSlash = T2.attachInOwningWindow('s6', '/ws/kiro');
+    for (let i = 0; i < 50 && !fSlash[0].got.length; i++) await new Promise((r) => setTimeout(r, 5));
+    check('从属上报的路径带尾斜杠也能匹配上', fSlash[0].got.length === 1);
+    if (fSlash[0].got.length) {
+      T2.resolveFollowerForTest(fSlash[0].got[0].reqId, { ok: true });
+      await pSlash;
+    }
+    T2.setFollowerTimeoutForTest(4000);
+    T2.setRelayForTest(null);
+  }
 }
 
 // 收尾：把 HOME 放回去，删掉沙箱

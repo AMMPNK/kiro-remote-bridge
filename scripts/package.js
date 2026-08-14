@@ -20,6 +20,7 @@ const STAGE = path.join(OUT_DIR, 'stage');
 const WHITELIST = [
   'package.json',
   'src/extension.js',
+  'src/follower.js',
   'src/muxClient.js',
   'src/presets.js',
   'src/relay.js',
